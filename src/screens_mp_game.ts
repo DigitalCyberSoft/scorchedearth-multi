@@ -138,6 +138,17 @@ export class MpGameScreen extends Screen {
         this._submitLocalCart(true);
         return true;
       };
+      // Simulate a divergent/cheating client: perturb local state so this client's next
+      // worldHash differs from the others, which the host must DETECT (onDesync). Used to
+      // prove the desync detector fires (every passing test otherwise shows 0 desyncs).
+      g.__mpDesync = (): boolean => {
+        const gs = this.adapter.state();
+        const t0 = gs?.tanks?.[0] as { health: number; x: number } | undefined;
+        if (!t0) return false;
+        if (t0.health > 1) t0.health -= 1;
+        else t0.x += 3;
+        return true;
+      };
     }
   }
 
