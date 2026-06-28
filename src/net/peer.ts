@@ -6,7 +6,7 @@
 // Deterministic initiator: the peer with the lexically smaller device id creates
 // the offer and owns reconnect, so two peers never both initiate.
 // ───────────────────────────────────────────────────────────────────────────
-import { RTC_CONFIG, DC_LABEL, DC_CONFIG } from "./netconfig";
+import { rtcConfig, DC_LABEL, DC_CONFIG } from "./netconfig";
 import { DEVICE_ID } from "./identity";
 import { sendOffer, sendAnswer, sendIceCandidate } from "./signaling";
 
@@ -37,7 +37,7 @@ export class PeerManager {
       if (s === "connected" || s === "connecting" || s === "new") return existing;
       this._cleanup(peerId, false);
     }
-    const pc = new RTCPeerConnection(RTC_CONFIG);
+    const pc = new RTCPeerConnection(rtcConfig());
     const conn: Conn = { pc, dc: null, encKey, relays, iceQueue: [], backoff: 2000, reconnectTimer: null, remoteDescSet: false };
     this._conns.set(peerId, conn);
 

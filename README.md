@@ -87,13 +87,17 @@ authenticated data channel.
 
 This is a working vertical slice, not a shipped product:
 
-- **Cross-network NAT traversal is the remaining unknown** (signaling is not). Discovery
-  and signaling over the **default public Nostr relays** are proven end to end - two
-  browsers connect with no local server. What is untested is two peers on *different* real
-  networks: WebRTC here is **STUN-only, with no TURN server**, so a pair behind symmetric
-  NATs may fail to hole-punch and would need a TURN relay. All WebRTC testing so far was
-  same-machine (loopback), so same-network works; arbitrary-NAT pairs are unproven.
-  (`?relays=ws://...` can still point the app at a private relay.)
+- **Symmetric-NAT pairs need a TURN relay, which is opt-in.** Signaling over the default
+  public Nostr relays is proven, and multiple public **STUN** servers connect every NAT
+  pair *except* two **symmetric** NATs - those physically require a TURN relay. TURN is
+  wired and proven (the tests connect two peers **relay-only** through a TURN server and
+  pass a message), but it **ships with no credentials**: there is no longer a reliable
+  zero-signup public TURN (the Open Relay static-credential service is deprecated, verified
+  here). To make it bulletproof across arbitrary networks, add free-tier TURN creds
+  (**Metered** ~50 GB/mo or **Cloudflare** ~1 TB/mo, both free) to `TURN_SERVERS` in
+  `src/net/netconfig.ts` and rebuild, or inject them at runtime with
+  `?turn=<base64 of a JSON RTCIceServer>`. WebRTC connection testing so far was same-machine
+  (loopback). (`?relays=ws://...` can still point at a private Nostr relay.)
 - A detected desync is **reported, not auto-healed** (`EngineAdapter.snapshot`/`restore`
   is a stub: it would wire `savegame.serialize`/`apply` plus the MT19937 stream position).
   In practice the lockstep + host-authoritative shop have shown zero desyncs across the

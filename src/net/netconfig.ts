@@ -30,13 +30,55 @@ export const NOSTR_RELAYS: readonly string[] = [
   "wss://relay.noswhere.com",
 ];
 
-/** STUN only (no TURN): NAT hole-punching works for most peer pairs but FAILS for
- *  some symmetric-NAT pairs. A TURN relay is the later fix; see README "Limits". */
+/** Public STUN (zero-config). Multiple servers + Cloudflare's so a single outage doesn't
+ *  block gathering; STUN reflexive candidates traverse every NAT pair EXCEPT two symmetric
+ *  NATs, which physically require a TURN relay (see TURN_SERVERS). */
 export const STUN_SERVERS: RTCIceServer[] = [
-  { urls: "stun:stun.l.google.com:19302" },
-  { urls: "stun:stun1.l.google.com:19302" },
+  {
+    urls: [
+      "stun:stun.l.google.com:19302",
+      "stun:stun1.l.google.com:19302",
+      "stun:stun2.l.google.com:19302",
+      "stun:stun.cloudflare.com:3478",
+    ],
+  },
 ];
-export const RTC_CONFIG: RTCConfiguration = { iceServers: STUN_SERVERS };
+
+/** TURN is OPT-IN. A pair of *symmetric* NATs cannot be hole-punched with STUN alone; only
+ *  a TURN relay bridges them. There is NO reliable zero-signup public TURN (the Open Relay
+ *  static-credential service is deprecated -- verified 2026-06-28: its hosts allocate no
+ *  relay candidate). To make connectivity bulletproof, paste free-tier creds here (Metered
+ *  ~50 GB/mo or Cloudflare ~1 TB/mo, both free to sign up) and rebuild, OR inject them at
+ *  runtime with `?turn=<base64 of a JSON RTCIceServer or RTCIceServer[]>` (no rebuild).
+ *  Empty => STUN-only, which already connects every NON-symmetric pair. */
+export const TURN_SERVERS: RTCIceServer[] = [
+  // Example -- replace with YOUR free-tier TURN creds, then `npm run build` + redeploy:
+  // {
+  //   urls: ["turn:relay.example.com:80", "turn:relay.example.com:80?transport=tcp",
+  //          "turns:relay.example.com:443?transport=tcp"],
+  //   username: "USERNAME", credential: "CREDENTIAL",
+  // },
+];
+
+/** Runtime TURN override: ?turn=<base64(JSON)> where JSON is an RTCIceServer or an array
+ *  of them. Lets a deployment (or the test harness) add TURN without a rebuild. */
+function _turnOverride(): RTCIceServer[] {
+  try {
+    const params = new URLSearchParams(typeof location !== "undefined" ? location.search : "");
+    const raw = params.get("turn");
+    if (!raw) return [];
+    const parsed = JSON.parse(atob(raw)) as RTCIceServer | RTCIceServer[];
+    return Array.isArray(parsed) ? parsed : [parsed];
+  } catch {
+    return []; // malformed override: fall back to STUN + any compiled-in TURN
+  }
+}
+
+/** The live ICE config: public STUN + any compiled-in TURN + any ?turn= override. Read at
+ *  each RTCPeerConnection so a runtime override applies. */
+export function rtcConfig(): RTCConfiguration {
+  return { iceServers: [...STUN_SERVERS, ...TURN_SERVERS, ..._turnOverride()] };
+}
 
 // Nostr event kinds.
 export const SIGNALING_KIND = 20078; // ephemeral: WebRTC signaling + room presence
