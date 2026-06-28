@@ -5,10 +5,11 @@ A browser reimplementation of **Scorched Earth v1.5** (1995, DOS) by **Wendell H
 **with online multiplayer added** (serverless peer-to-peer; see below).
 No plugins, no WASM, no Python or DOS runtime.
 
-This is the multiplayer fork of the single-player port. The single-player original is
-playable at https://digitalcybersoft.github.io/scorchedearth-html5/ ; this fork is run
-locally for now (`npm run dev`) and has **no public multiplayer URL yet** (see
-"Not production-ready").
+This is the multiplayer fork of the single-player port. **Play it at
+https://digitalcybersoft.github.io/scorchedearth-multi/** - open it in two browsers (or
+two devices), create a private match in one, and join with the invite code in the other;
+discovery and signaling run over public Nostr relays with no server to set up. The
+single-player original is at https://digitalcybersoft.github.io/scorchedearth-html5/ .
 
 It reproduces the original's turn-based tank artillery - destructible terrain, the
 weapon shop, the computer players, the physics and wind, the economy and scoring -
@@ -56,10 +57,17 @@ converged (identical world hash, zero desyncs). Verified by:
 
 - `test/mp_lockstep.test.ts` - in-process determinism (5-round, up to 3 players, human
   and AI), part of `npm test`.
-- A 3-browser, real-keypress, 5-round playthrough over a local Nostr relay.
+- A 2-browser connection over the **default public Nostr relays** (no local server): the
+  peers discover each other from the invite and form the WebRTC mesh in seconds, then start
+  a converged match. (The local relay below is only a faster, offline test fixture - public
+  relays are the default and work.)
+- A 3-browser, real-keypress, 5-round playthrough (run over a local relay for speed and
+  determinism).
 - A 3-browser **shop test**: two players buy weapons and one buys nothing; every client
   converges on identical inventories (an inventory digest, since the world hash omits
   inventory) plus identical world hash, zero desyncs.
+- A desync-detection test: a clean run reports zero desyncs, and a deliberately injected
+  divergence on one client is caught by the host.
 - Behavioral checks for the per-turn forfeit and match-ends-on-disconnect.
 
 Code: `src/net/{nostr,peer,signaling,match,lockstep,engine_adapter,sim_driver,metrics}.ts`,
@@ -79,11 +87,13 @@ authenticated data channel.
 
 This is a working vertical slice, not a shipped product:
 
-- **Real-internet play is unproven.** All testing used a **local** Nostr relay and
-  WebRTC loopback on one machine. It is **STUN-only, with no TURN server**, so peers
-  behind symmetric NATs on the open internet may fail to connect. A TURN server and
-  cross-network testing are required before public play. (`?relays=ws://...` points the
-  app at a specific relay.)
+- **Cross-network NAT traversal is the remaining unknown** (signaling is not). Discovery
+  and signaling over the **default public Nostr relays** are proven end to end - two
+  browsers connect with no local server. What is untested is two peers on *different* real
+  networks: WebRTC here is **STUN-only, with no TURN server**, so a pair behind symmetric
+  NATs may fail to hole-punch and would need a TURN relay. All WebRTC testing so far was
+  same-machine (loopback), so same-network works; arbitrary-NAT pairs are unproven.
+  (`?relays=ws://...` can still point the app at a private relay.)
 - A detected desync is **reported, not auto-healed** (`EngineAdapter.snapshot`/`restore`
   is a stub: it would wire `savegame.serialize`/`apply` plus the MT19937 stream position).
   In practice the lockstep + host-authoritative shop have shown zero desyncs across the
@@ -97,7 +107,6 @@ This is a working vertical slice, not a shipped product:
   and accuracy depends on relay retention. Treat the count as a rough signal, not analytics.
 - Test hooks (the `__mp*` window globals, including an auto-fire driver) are compiled out
   of production and enabled only with `?test=1`.
-- Not yet committed to a repository or deployed; there is no public multiplayer URL.
 
 ## Screenshots
 
