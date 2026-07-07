@@ -19,6 +19,7 @@ import { Match, listPublicMatches, type MatchInfo, type RoomPlayer, type Role } 
 import { LockstepSession, type MatchStart, type PlayerSlot } from "./net/lockstep";
 import { createEngineAdapter, type GameEngineAdapter } from "./net/engine_adapter";
 import { MpGameScreen, type MpApp } from "./screens_mp_game";
+import { ChatOverlay } from "./mp_chat";
 import { testHooks } from "./net/netconfig";
 
 const AI_HUMAN = 0; // constants.AI_HUMAN
@@ -47,6 +48,7 @@ export class MultiplayerScreen extends Screen {
   private unsubList: (() => void) | null = null;
   private started = false;
   private aiCount = 0; // host-staged computer opponents (default class Unknown)
+  private chat: ChatOverlay | null = null; // room chat (created with the match; carried into the game)
   private _rosterSig = ""; // last roster/connection signature (rebuild only on change)
 
   constructor(
@@ -69,10 +71,13 @@ export class MultiplayerScreen extends Screen {
 
   /** Once the engine state exists (host after Start; guest after the "start"
    *  message), hand off to the in-game MP screen. */
-  override update(_dt: number): ScreenAction {
-    if (!this.transitioned && this.session && this.adapter.state()) {
+  override update(dt: number): ScreenAction {
+    this.chat?.tick(dt);
+    if (!this.transitioned && this.session && this.chat && this.adapter.state()) {
       this.transitioned = true;
-      this.app.push(new MpGameScreen(this.app, this.session, this.adapter, this.role));
+      // Hand the SAME chat overlay to the game screen: the lobby conversation
+      // stays on screen across the match start.
+      this.app.push(new MpGameScreen(this.app, this.session, this.adapter, this.role, this.chat));
     }
     return null;
   }
@@ -115,6 +120,18 @@ export class MultiplayerScreen extends Screen {
   }
 
   override handle(e: ScreenEvent): ScreenAction {
+    // Room chat, same interface as in-game: modal compose box (letters below are
+    // panel accelerators, so the box must capture every key), backquote to open.
+    if (this.chat) {
+      if (this.chat.open && e.type === pygame.KEYDOWN) {
+        this.chat.handleKey(e);
+        return null;
+      }
+      if (e.type === pygame.KEYDOWN && e.key === pygame.K_BACKQUOTE) {
+        this.chat.open = true;
+        return null;
+      }
+    }
     const a = this.panel.handle(e);
     if (a === null) return null;
     if (a === "back") {
@@ -143,9 +160,11 @@ export class MultiplayerScreen extends Screen {
   private async _create(isPublic: boolean): Promise<void> {
     this._cleanup();
     this.status = isPublic ? "Creating public match..." : "Creating private match...";
+    // Room capacity is the ENGINE limit (10 tanks), not the SP MAXPLAYERS setting
+    // (default 2): people can keep joining until the host starts the match.
     this.match = isPublic
-      ? await Match.createPublic("Scorch Game", this.cfg.MAXPLAYERS, this.myName, this.myTankIcon)
-      : await Match.createPrivate("Scorch Game", this.cfg.MAXPLAYERS, this.myName, this.myTankIcon);
+      ? await Match.createPublic("Scorch Game", MAX_MP_TANKS, this.myName, this.myTankIcon)
+      : await Match.createPrivate("Scorch Game", MAX_MP_TANKS, this.myName, this.myTankIcon);
     this._wireMatch("host");
     if (testHooks()) (globalThis as Record<string, unknown>).__mpInvite = this.match.inviteCode();
     if (isPublic) {
@@ -195,12 +214,14 @@ export class MultiplayerScreen extends Screen {
   private _start(): void {
     if (!this.match || this.match.role !== "host" || !this.session || this.started) return;
     const players = this.match.players();
-    if (players.length < 2 || !players.every((p) => p.connected || p.deviceId === DEVICE_ID)) {
+    // >=2 tanks total (humans + staged computers) and every human connected --
+    // matches the Start button's visibility gate (host-vs-computers is allowed).
+    if (players.length + this.aiCount < 2 || !players.every((p) => p.connected || p.deviceId === DEVICE_ID)) {
       this.status = "Waiting for all players to connect before starting.";
       this._rebuild();
       return;
     }
-    const order: PlayerSlot[] = players.map((p) => ({
+    const order: PlayerSlot[] = players.slice(0, MAX_MP_TANKS).map((p) => ({
       deviceId: p.deviceId,
       name: p.name,
       tankIcon: p.tankIcon, // each player's chosen tank (carried via presence)
@@ -208,11 +229,15 @@ export class MultiplayerScreen extends Screen {
     }));
     // Host-staged computer opponents. Class Unknown = the engine re-rolls a random
     // real class at first reveal (deterministic: seeded rng, same on every client).
-    for (let i = 0; i < this.aiCount; i++) {
+    // Humans outrank computers: late joiners can shrink the AI allotment, and the
+    // total is clamped to the engine's 10-tank round limit.
+    const humanCount = order.length;
+    const aiRoom = Math.max(0, Math.min(this.aiCount, MAX_MP_TANKS - humanCount));
+    for (let i = 0; i < aiRoom; i++) {
       order.push({
         deviceId: `ai-${i + 1}`, // never a real DEVICE_ID: no client claims its turns
         name: `Computer ${i + 1}`,
-        tankIcon: (players.length + i) % 7,
+        tankIcon: (humanCount + i) % 7,
         aiClass: AI_UNKNOWN,
       });
     }
@@ -260,6 +285,12 @@ export class MultiplayerScreen extends Screen {
   private _wireMatch(role: "host" | "guest"): void {
     if (!this.match) return;
     this.role = role;
+    // Room chat over the mesh data channels -- live from the moment peers connect,
+    // so people can talk while waiting for the host to start.
+    this.chat = new ChatOverlay(
+      (t) => this.session?.sendChat(t),
+      () => this.myName,
+    );
     this.match.handlers.onRoster = (ps) => {
       this.roster = ps;
       // Rebuild only when the roster or a connection state changes, so the host's Start
@@ -285,6 +316,13 @@ export class MultiplayerScreen extends Screen {
     }
     this.match.handlers.onRoster?.(this.match.players()); // seed roster (self)
     this.session = new LockstepSession(this.match, this.adapter, role);
+    this.session.onChat = (deviceId, text) => {
+      const name = this.match?.players().find((p) => p.deviceId === deviceId)?.name ?? deviceId.slice(0, 6);
+      this.chat?.push(name, text);
+      if (testHooks()) {
+        (globalThis as Record<string, unknown>).__mpLobbyChat = { count: this.chat?.count() ?? 0, last: this.chat?.last() ?? null };
+      }
+    };
     this.session.onDesync = (n, peer) => {
       this.lines.push(`DESYNC turn ${n} from ${peer.slice(0, 6)}`);
       if (testHooks()) {
@@ -303,6 +341,7 @@ export class MultiplayerScreen extends Screen {
     this.roster = [];
     this.started = false;
     this.aiCount = 0;
+    this.chat = null;
   }
 
   // ── Render ───────────────────────────────────────────────────────────────────
@@ -342,11 +381,12 @@ export class MultiplayerScreen extends Screen {
         line(`  ${p.name}${tag}`, p.connected || p.deviceId === DEVICE_ID ? C_OK : C_WAIT);
       }
       for (let i = 0; i < this.aiCount; i++) line(`  Computer ${i + 1} [AI: Unknown]`, C_OK);
+      line("` to chat with the room", W.C_TEXT);
       if (this.match.role === "host" && !this.started) {
         const ps = this.match.players();
         if (ps.length + this.aiCount < 2) line("Add a computer or wait for a player to join...", C_WAIT);
         else if (!ps.every((p) => p.connected || p.deviceId === DEVICE_ID)) line("Waiting for players to connect...", C_WAIT);
-        else line("Ready -- press Start Match.", C_OK);
+        else line("Ready -- press Start Match. Joins stay open until you start.", C_OK);
       }
     }
 
@@ -356,6 +396,7 @@ export class MultiplayerScreen extends Screen {
       this.publicMatches.forEach((m, i) => line(`  ${i + 1}. ${m.name} - ${m.players}/${m.maxPlayers}`));
     }
 
+    this.chat?.draw(surf, this.w, this.h); // room chat rides over the lobby panels
     draw_cursor(surf);
   }
 }

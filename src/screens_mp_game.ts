@@ -38,7 +38,8 @@ import { GameState, AIM, ROUND_END, SHOP, GAME_OVER } from "./game";
 import { FIXED_DT } from "./net/sim_driver";
 import { DEVICE_ID } from "./net/identity";
 import { testHooks, PEER_DEAD_MS } from "./net/netconfig";
-import { sanitizeChat, type LockstepSession, type ShopResult } from "./net/lockstep";
+import type { LockstepSession, ShopResult } from "./net/lockstep";
+import { ChatOverlay } from "./mp_chat";
 import type { Role } from "./net/match";
 import type { GameEngineAdapter } from "./net/engine_adapter";
 
@@ -55,10 +56,6 @@ const DEFAULT_SHOP_IDLE_SECONDS = 60; // shop auto-finishes after this much INAC
 const SHOP_GRACE_SECONDS = 2; // host allows this much extra for keepalives/carts in flight
 const DEFAULT_SHOP_CEILING_SECONDS = 300; // absolute per-shop bound (?shopCeiling; anti-stall backstop)
 const SHOP_ACT_INTERVAL_SECONDS = 2; // broadcast "still shopping" at most this often
-const CHAT_KEEP = 50; // chat lines retained
-const CHAT_SHOW = 6; // chat lines visible in the overlay
-const CHAT_TTL_S = 20; // a line fades from the overlay after this long
-const CHAT_INPUT_MAX = 100; // compose-box length cap (wire caps again at 120)
 
 /** Inputs to the host's shop barrier decision (all values on the HOST's clock). */
 export interface ShopBarrierState {
@@ -125,11 +122,9 @@ export class MpGameScreen extends Screen {
   private preShop = new Map<string, ShopResult>(); // host: deviceId -> pre-shop state
   private hostLastActMs = new Map<string, number>(); // host: deviceId -> last sign of shopping life
   private pendingShopFinal: { round: number; results: Record<string, ShopResult> } | null = null;
-  // ── chat overlay (transparent; gameplay + shop; never touches the sim) ──
-  private chatLines: { name: string; text: string; at: number }[] = [];
-  private chatOpen = false;
-  private chatText = "";
-  private nowS = 0; // monotonic screen clock (chat fading)
+  // ── chat overlay (transparent; shared with the lobby, so the pre-match
+  //    conversation carries into the game; never touches the sim) ──
+  private readonly chat: ChatOverlay;
   private banner = "";
   private readonly shopSeconds: number;
   private readonly shopCeiling: number;
@@ -153,12 +148,13 @@ export class MpGameScreen extends Screen {
   private aborted = ""; // non-empty => match ended (e.g., a player left)
   private overQuote: readonly [string, string] | null = null; // game-over war quote, picked once
 
-  constructor(app: MpApp, session: LockstepSession, adapter: GameEngineAdapter, role: Role) {
+  constructor(app: MpApp, session: LockstepSession, adapter: GameEngineAdapter, role: Role, chat: ChatOverlay) {
     super();
     this.app = app;
     this.session = session;
     this.adapter = adapter;
     this.role = role;
+    this.chat = chat; // owned/wired by the lobby (session.onChat feeds it there)
     this.isHost = role === "host";
     const params = new URLSearchParams(typeof location !== "undefined" ? location.search : "");
     this.shopSeconds = Number(params.get("shopSeconds")) || DEFAULT_SHOP_IDLE_SECONDS;
@@ -196,7 +192,6 @@ export class MpGameScreen extends Screen {
     this.session.onShopFinal = (round, results) => {
       if (!this.isHost) this.pendingShopFinal = { round, results };
     };
-    this.session.onChat = (deviceId, text) => this._pushChat(this._nameOf(deviceId), text);
     // Test hook (harness only, ?test=1): commit an rng-free aimed shot on this
     // client's turn. NEVER exposed in production -- it would be a console auto-fire
     // cheat. (Calling the engine AI would draw rng on only the active client and
@@ -308,11 +303,11 @@ export class MpGameScreen extends Screen {
     // Chat input is modal: while the compose box is open it captures EVERY key
     // (Esc cancels, Enter sends, Backspace edits, printable chars append), so chat
     // can never collide with aim keys (Space/Enter fire!) or shop accelerators.
-    if (this.chatOpen && event.type === pygame.KEYDOWN) {
+    if (this.chat.open && event.type === pygame.KEYDOWN) {
       // Typing chat is being at the keyboard: while the local shop is open it also
       // counts as shop activity, so composing a line can't idle a shopper out.
       if (gs.phase === SHOP && this.shopStack.length > 0) this._noteShopActivity();
-      this._handleChatKey(event);
+      this.chat.handleKey(event);
       return null;
     }
     // Backquote opens chat anywhere in the match (aim, flight, shop, waiting).
@@ -320,7 +315,7 @@ export class MpGameScreen extends Screen {
     // panel, Tab cycles weapons -- all unavailable).
     if (event.type === pygame.KEYDOWN && event.key === pygame.K_BACKQUOTE) {
       if (gs.phase === SHOP && this.shopStack.length > 0) this._noteShopActivity();
-      this.chatOpen = true;
+      this.chat.open = true;
       return null;
     }
     // Host prompt: a player disconnected -- replace their tank with a computer?
@@ -363,7 +358,7 @@ export class MpGameScreen extends Screen {
   }
 
   override update(dt: number): ScreenAction {
-    this.nowS += dt; // screen clock (chat fading); independent of the sim
+    this.chat.tick(dt); // overlay clock (line fading); independent of the sim
     const gs = this.adapter.state();
     if (!gs) return null;
     this.gsRef = gs;
@@ -421,8 +416,8 @@ export class MpGameScreen extends Screen {
       shopping: this.shopStack.length > 0,
       shopIdle: Math.round(this.shopIdle * 10) / 10,
       waitingFor: gs.phase === SHOP ? this._pendingNames() : [],
-      chatCount: this.chatLines.length,
-      chatLast: this.chatLines.length > 0 ? this.chatLines[this.chatLines.length - 1].text : null,
+      chatCount: this.chat.count(),
+      chatLast: this.chat.last(),
       cpuOffer: this.cpuOffer ? this.cpuOffer.name : null,
       aiTanks: gs.tanks.filter((t) => (t as unknown as { ai_class: number }).ai_class !== 0).length,
       desync: this.desyncNote !== "",
@@ -695,41 +690,6 @@ export class MpGameScreen extends Screen {
     return p ? p.name : deviceId.slice(0, 6);
   }
 
-  // ── chat (overlay-only; the wire layer sanitizes + rate-limits) ──────────────
-
-  private _pushChat(name: string, text: string): void {
-    this.chatLines.push({ name, text, at: this.nowS });
-    if (this.chatLines.length > CHAT_KEEP) this.chatLines.splice(0, this.chatLines.length - CHAT_KEEP);
-  }
-
-  /** Modal compose-box keys: Esc cancels, Enter sends, Backspace edits, printable
-   *  characters append (event.unicode carries the produced character). */
-  private _handleChatKey(event: ScreenEvent): void {
-    if (event.key === pygame.K_ESCAPE) {
-      this.chatOpen = false;
-      this.chatText = "";
-      return;
-    }
-    if (event.key === pygame.K_RETURN || event.key === pygame.K_KP_ENTER) {
-      const clean = sanitizeChat(this.chatText); // mirror exactly what the wire will carry
-      if (clean) {
-        this.session.sendChat(clean);
-        this._pushChat(this._nameOf(DEVICE_ID), clean); // broadcast excludes self: local echo
-      }
-      this.chatOpen = false;
-      this.chatText = "";
-      return;
-    }
-    if (event.key === pygame.K_BACKSPACE) {
-      this.chatText = this.chatText.slice(0, -1);
-      return;
-    }
-    const u = event.unicode ?? "";
-    if (u.length === 1 && u.charCodeAt(0) >= 0x20 && this.chatText.length < CHAT_INPUT_MAX) {
-      this.chatText += u;
-    }
-  }
-
   /** Top-center notices: the host's CPU-replacement prompt and a detected desync.
    *  Drawn over gameplay AND the shop (below the engine HUD). */
   private _drawNotices(surf: pygame.Surface): void {
@@ -748,31 +708,8 @@ export class MpGameScreen extends Screen {
     if (this.desyncNote) note(this.desyncNote, [255, 120, 110]);
   }
 
-  /** Transparent chat overlay: the last few lines (fading) above the MP status
-   *  line, plus the compose box while typing. Drawn over gameplay AND the shop. */
   private _drawChat(surf: pygame.Surface): void {
-    const f = W.font(14, false);
-    const vis = this.chatLines.filter((l) => this.nowS - l.at < CHAT_TTL_S).slice(-CHAT_SHOW);
-    const rows = vis.length + (this.chatOpen ? 1 : 0);
-    if (rows === 0) return;
-    const lh = f.get_height() + 4;
-    const x = 12;
-    const w = 620;
-    const y0 = this.app.h - 66 - rows * lh;
-    // Semi-transparent backdrop so the text reads over terrain/shop alike.
-    const ov = new pygame.Surface([w, rows * lh + 10], pygame.SRCALPHA);
-    ov.fill([0, 0, 0, 110]);
-    surf.blit(ov, [x - 6, y0 - 5]);
-    let y = y0;
-    for (const l of vis) {
-      const name = f.render(`${l.name}: `, true, [180, 220, 255]);
-      surf.blit(name, [x, y]);
-      surf.blit(f.render(l.text, true, [235, 235, 235]), [x + name.get_width(), y]);
-      y += lh;
-    }
-    if (this.chatOpen) {
-      surf.blit(f.render(`say: ${this.chatText}_`, true, [140, 230, 160]), [x, y]);
-    }
+    this.chat.draw(surf, this.app.w, this.app.h);
   }
 
   /** Apply the host's authoritative post-shop state to every human tank, then resolve

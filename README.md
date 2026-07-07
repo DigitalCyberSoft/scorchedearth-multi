@@ -6,10 +6,13 @@ A browser reimplementation of **Scorched Earth v1.5** (1995, DOS) by **Wendell H
 No plugins, no WASM, no Python or DOS runtime.
 
 This is the multiplayer fork of the single-player port. **Play it at
-https://digitalcybersoft.github.io/scorchedearth-multi/** - open it in two browsers (or
-two devices), create a private match in one, and join with the invite code in the other;
-discovery and signaling run over public Nostr relays with no server to set up. The
-single-player original is at https://digitalcybersoft.github.io/scorchedearth-html5/ .
+https://digitalcybersoft.github.io/scorchedearth-multi/** - open it in two or more
+browsers (or devices, up to 10 tanks per match), create a private match in one, and
+join with the invite code in the others; people can keep joining until the host
+starts, computer opponents can fill the remaining slots, and there is a room chat
+while you wait. Discovery and signaling run over public Nostr relays with no server
+to set up. The single-player original is at
+https://digitalcybersoft.github.io/scorchedearth-html5/ .
 
 It reproduces the original's turn-based tank artillery - destructible terrain, the
 weapon shop, the computer players, the physics and wind, the economy and scoring -
@@ -41,7 +44,9 @@ each turn clients exchange a world hash so divergence is caught.
 1. Main Menu -> **Online Play** -> choose your name and tank on the setup screen
    (color and starting position are randomized).
 2. **Create Private Match** (share the invite code) or **Create Public Match** (others
-   find it in the public list), or **Join by Code**.
+   find it in the public list), or **Join by Code**. Joins stay open until the host
+   starts, up to the engine's 10-tank round limit (humans outrank staged computers
+   if the room fills).
 3. The host can also **Add Computer** opponents in the lobby (class *Unknown*: the
    engine rolls a random personality at first reveal). A match can even be the host
    alone against computers.
@@ -61,10 +66,11 @@ each turn clients exchange a world hash so divergence is caught.
    a player only times out after 60 seconds of shop **inactivity** (any input resets
    it), which then auto-submits whatever is in their cart. An absolute per-shop
    ceiling (5 minutes) stops a hostile client from stalling the match forever.
-7. **Chat any time with the backquote key (`)** - during aiming, flight, the shop, or
-   the between-round wait. It is a transparent overlay: Esc cancels, Enter sends,
-   lines fade after a few seconds. Chat rides its own message type and never touches
-   the simulation.
+7. **Chat any time with the backquote key (`)** - in the lobby while waiting for the
+   host to start, and in-game during aiming, flight, the shop, or the between-round
+   wait (the lobby conversation stays on screen into the match). It is a transparent
+   overlay: Esc cancels, Enter sends, lines fade after a few seconds. Chat rides its
+   own message type and never touches the simulation.
 
 ### What works (verified)
 
@@ -98,6 +104,9 @@ converged (identical world hash, zero desyncs). Verified by:
 - A **CPU-replacement acceptance**: the guest closes mid-match; the host is prompted,
   approves, the departed tank converts to a computer at its next turn, and the match
   keeps progressing instead of aborting.
+- A 3-browser **lobby acceptance**: three humans join one room, a chat line typed in
+  the lobby replicates to both other browsers before the start, the conversation is
+  still on screen once the match begins, and all three converge after the first turn.
 - Behavioral checks for the per-turn round forfeit and match-ends-on-disconnect.
 
 Code: `src/net/{nostr,peer,signaling,match,lockstep,engine_adapter,sim_driver,metrics}.ts`,
