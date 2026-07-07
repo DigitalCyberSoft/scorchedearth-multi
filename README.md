@@ -42,16 +42,26 @@ each turn clients exchange a world hash so divergence is caught.
    (color and starting position are randomized).
 2. **Create Private Match** (share the invite code) or **Create Public Match** (others
    find it in the public list), or **Join by Code**.
-3. When everyone shows connected, the host presses **Start**. Players take turns:
-   adjust angle (left/right) and power (up/down), then **Space** to fire. A countdown
-   bounds each turn, and the match runs a set number of rounds.
-4. **Between rounds the weapon shop opens for everyone at once.** Each player shops
+3. The host can also **Add Computer** opponents in the lobby (class *Unknown*: the
+   engine rolls a random personality at first reveal). A match can even be the host
+   alone against computers.
+4. When everyone shows connected, the host presses **Start**. Players take turns:
+   adjust angle (left/right) and power (up/down), then **Space** to fire. Idling at
+   your own turn past the countdown **forfeits the round, never the match** (your
+   tank retreats: no kill bonus for the enemy, you respawn next round with your
+   score and cash). A slow or backgrounded browser is never treated as idle - the
+   clock only runs once your own game reaches your turn, and an unfocused window
+   fast-forwards its simulation to catch up in real time.
+5. If a player disconnects mid-match, the host is asked whether to **replace them
+   with a computer**; the match then carries on (otherwise it ends once you are the
+   last one standing, as before).
+6. **Between rounds the weapon shop opens for everyone at once.** Each player shops
    their own tank; purchases are replicated to every client. The next round starts
    when **every player has finished** (host-coordinated). There is no flat countdown:
    a player only times out after 60 seconds of shop **inactivity** (any input resets
    it), which then auto-submits whatever is in their cart. An absolute per-shop
    ceiling (5 minutes) stops a hostile client from stalling the match forever.
-5. **Chat any time with the backquote key (`)** - during aiming, flight, the shop, or
+7. **Chat any time with the backquote key (`)** - during aiming, flight, the shop, or
    the between-round wait. It is a transparent overlay: Esc cancels, Enter sends,
    lines fade after a few seconds. Chat rides its own message type and never touches
    the simulation.
@@ -80,7 +90,15 @@ converged (identical world hash, zero desyncs). Verified by:
   gameplay and over the open shop; inventories and world hashes converge, zero desyncs.
 - A desync-detection test: a clean run reports zero desyncs, and a deliberately injected
   divergence on one client is caught by the host.
-- Behavioral checks for the per-turn forfeit and match-ends-on-disconnect.
+- A **throttled-client acceptance**: with the guest's CPU throttled 15x while the host
+  fires, the round never ends early, the slow guest is never forfeited, and its world
+  hash converges with the host's once it catches up.
+- An **AI-opponent acceptance**: 2 humans + 1 lobby-added computer play a full round;
+  AI turns auto-resolve identically on every client, hashes match at every aim barrier.
+- A **CPU-replacement acceptance**: the guest closes mid-match; the host is prompted,
+  approves, the departed tank converts to a computer at its next turn, and the match
+  keeps progressing instead of aborting.
+- Behavioral checks for the per-turn round forfeit and match-ends-on-disconnect.
 
 Code: `src/net/{nostr,peer,signaling,match,lockstep,engine_adapter,sim_driver,metrics}.ts`,
 the lobby `src/screens_mp.ts`, and the in-game screen `src/screens_mp_game.ts`.
@@ -93,11 +111,20 @@ one snapshot of every tank's inventory that every client applies before the next
 message ordering cannot desync inventories. The host advances the shop only when every
 cart is in, when every missing player has been shop-inactive past the allowance, or at the
 absolute ceiling; shop carts and keepalives are **round-tagged** so a message from one shop
-can never satisfy another shop's barrier. Untrusted peer input is bounds-checked
-(angle/power/weapon clamped, NaN rejected, the turn buffer is windowed and per-sender),
-chat is sanitized (control characters stripped, length-capped) and per-peer rate-limited,
-and match-control messages (start / forfeit / shop outcome) are accepted only from the
-host's authenticated data channel.
+can never satisfy another shop's barrier. Forfeits ride the same numbered turn pipeline
+as shots (a "retreat turn"), so they are ordered and applied at every client's own aim
+barrier: the turn timeout is enforced by the active player's OWN client (a slow or
+backgrounded browser is late, not idle), and the host may stand in only with a
+retreat/convert turn for a transport-dead or stuck client - never a shot. Each client
+also steps its simulation by real elapsed time (bounded), so an unfocused window whose
+rAF Chrome pauses fast-forwards to the barrier instead of crawling in slow motion. The
+host's copy of the match config is sanitized before broadcast (team mode off, sequential
+play), and every roster slot gets a distinct team id, so persisted single-player settings
+cannot collapse the round flow. Untrusted peer input is bounds-checked (angle/power/
+weapon clamped, NaN rejected, aiClass clamped, the turn buffer is windowed and
+per-sender), chat is sanitized (control characters stripped, length-capped) and per-peer
+rate-limited, and match-control messages (start / shop outcome) are accepted only from
+the host's authenticated data channel.
 
 ### Not production-ready (honest limitations)
 

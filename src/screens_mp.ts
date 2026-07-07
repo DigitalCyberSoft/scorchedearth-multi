@@ -22,6 +22,8 @@ import { MpGameScreen, type MpApp } from "./screens_mp_game";
 import { testHooks } from "./net/netconfig";
 
 const AI_HUMAN = 0; // constants.AI_HUMAN
+const AI_UNKNOWN = 8; // constants.AI_UNKNOWN -- "random": the engine re-rolls a real class at reveal
+const MAX_MP_TANKS = 10; // engine max tanks per round (config.py MAXPLAYERS range 2-10); NOT cfg.MAXPLAYERS, which is the SP player-count setting (default 2)
 
 export class MultiplayerScreen extends Screen {
   override opaque = true;
@@ -44,6 +46,7 @@ export class MultiplayerScreen extends Screen {
   private publicMatches: MatchInfo[] = [];
   private unsubList: (() => void) | null = null;
   private started = false;
+  private aiCount = 0; // host-staged computer opponents (default class Unknown)
   private _rosterSig = ""; // last roster/connection signature (rebuild only on change)
 
   constructor(
@@ -90,9 +93,13 @@ export class MultiplayerScreen extends Screen {
     y += 10;
     if (this.match && this.match.role === "host" && !this.started) {
       if (!this.match.isPublic) add("~Copy Invite", "mp_copy");
-      // Start is gated until >=2 players are present AND every one of them is connected.
+      // Computer opponents (host-staged; carried to every client in the start order).
       const ps = this.match.players();
-      if (ps.length >= 2 && ps.every((p) => p.connected || p.deviceId === DEVICE_ID)) {
+      if (ps.length + this.aiCount < MAX_MP_TANKS) add("A~dd Computer", "mp_add_ai");
+      if (this.aiCount > 0) add(`~Remove Computer (${this.aiCount})`, "mp_del_ai");
+      // Start is gated until >=2 tanks are staged (humans + computers) AND every
+      // human present is connected. Host + computers alone is a valid match.
+      if (ps.length + this.aiCount >= 2 && ps.every((p) => p.connected || p.deviceId === DEVICE_ID)) {
         add("~Start Match", "mp_start");
       }
     }
@@ -120,6 +127,13 @@ export class MultiplayerScreen extends Screen {
     else if (a === "mp_list") void this._list();
     else if (a === "mp_start") this._start();
     else if (a === "mp_copy") this._copyInvite();
+    else if (a === "mp_add_ai") {
+      this.aiCount++;
+      this._rebuild();
+    } else if (a === "mp_del_ai") {
+      this.aiCount = Math.max(0, this.aiCount - 1);
+      this._rebuild();
+    }
     else if (a.startsWith("mp_joinpub_")) void this._joinPublic(Number(a.slice("mp_joinpub_".length)));
     return null; // handled internally; do not bubble
   }
@@ -192,12 +206,34 @@ export class MultiplayerScreen extends Screen {
       tankIcon: p.tankIcon, // each player's chosen tank (carried via presence)
       aiClass: AI_HUMAN,
     }));
+    // Host-staged computer opponents. Class Unknown = the engine re-rolls a random
+    // real class at first reveal (deterministic: seeded rng, same on every client).
+    for (let i = 0; i < this.aiCount; i++) {
+      order.push({
+        deviceId: `ai-${i + 1}`, // never a real DEVICE_ID: no client claims its turns
+        name: `Computer ${i + 1}`,
+        tankIcon: (players.length + i) % 7,
+        aiClass: AI_UNKNOWN,
+      });
+    }
     const seed = crypto.getRandomValues(new Uint32Array(1))[0];
+    // The broadcast cfg is the host's PERSISTED single-player config (localStorage
+    // scorch.cfg), so SP settings that change the round-flow contract must be
+    // sanitized out. TEAM_MODE: the MP roster gives every player the same team_id
+    // default, so any team mode makes _win_check see ONE alive team and end the
+    // round at the first turn (reproduced: straight to the shop with everyone
+    // alive and zero shots fired). PLAY_MODE: the MP loop (fire wrapper, AIM
+    // barrier, turn pump) is built for SEQUENTIAL only; SYNCHRONOUS/SIMULTANEOUS
+    // route the engine into SYNC_AIM/SIM_LIVE, which MP does not drive.
     const start: MatchStart = {
       seed,
       w: this.w,
       h: this.h,
-      cfg: { ...(this.cfg as unknown as Record<string, unknown>) },
+      cfg: {
+        ...(this.cfg as unknown as Record<string, unknown>),
+        TEAM_MODE: "NONE",
+        PLAY_MODE: "SEQUENTIAL",
+      },
       order,
     };
     this.session.startMatch(start);
@@ -266,6 +302,7 @@ export class MultiplayerScreen extends Screen {
     this.session = null;
     this.roster = [];
     this.started = false;
+    this.aiCount = 0;
   }
 
   // ── Render ───────────────────────────────────────────────────────────────────
@@ -304,9 +341,10 @@ export class MultiplayerScreen extends Screen {
         const tag = p.deviceId === DEVICE_ID ? " (you)" : p.connected ? " [connected]" : " [connecting]";
         line(`  ${p.name}${tag}`, p.connected || p.deviceId === DEVICE_ID ? C_OK : C_WAIT);
       }
+      for (let i = 0; i < this.aiCount; i++) line(`  Computer ${i + 1} [AI: Unknown]`, C_OK);
       if (this.match.role === "host" && !this.started) {
         const ps = this.match.players();
-        if (ps.length < 2) line("Waiting for another player to join...", C_WAIT);
+        if (ps.length + this.aiCount < 2) line("Add a computer or wait for a player to join...", C_WAIT);
         else if (!ps.every((p) => p.connected || p.deviceId === DEVICE_ID)) line("Waiting for players to connect...", C_WAIT);
         else line("Ready -- press Start Match.", C_OK);
       }

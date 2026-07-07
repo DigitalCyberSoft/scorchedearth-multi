@@ -73,8 +73,15 @@ export function createEngineAdapter(): GameEngineAdapter {
       const cfg = Object.assign(new Config(), start.cfg) as Config;
       gs = createGameState(cfg, start.w, start.h, start.seed);
       order = [];
+      let slot = 0;
       for (const s of start.order) {
-        gs.add_player(s.name, s.aiClass, 0, s.tankIcon);
+        // aiClass is host-supplied wire data: clamp to the engine's class range
+        // (0=human .. 8=Unknown). Distinct team_id per player: MP is free-for-all.
+        // With a shared team_id a team-mode config makes _win_check count ONE alive
+        // team and end every round instantly (the host cfg is also sanitized --
+        // this is the backstop).
+        const ai = Number.isInteger(s.aiClass) && s.aiClass >= 0 && s.aiClass <= C.AI_UNKNOWN ? s.aiClass : 0;
+        gs.add_player(s.name, ai, slot++, s.tankIcon);
         order.push(s.deviceId);
       }
       gs.new_game();
@@ -92,6 +99,15 @@ export function createEngineAdapter(): GameEngineAdapter {
       const t = gs.current_shooter;
       if (!t) return;
       const s = sanitizeTurnInput(input);
+      if (s.convert && s.convert.tank < gs.tanks.length) {
+        // CPU replacement of a departed player: identical assignment on every
+        // client at the same barrier; the engine drives the tank from its next turn.
+        (gs.tanks[s.convert.tank] as unknown as TankShape).ai_class = s.convert.aiClass;
+      }
+      if (s.retreat) {
+        gs.retreat(); // turn-timeout self-forfeit / eviction: ordered like any turn
+        return;
+      }
       t.angle = s.angle;
       t.power = s.power;
       t.selected_weapon = s.weapon;

@@ -25,15 +25,33 @@ export const FIXED_DT = 1 / 60;
  *  NaN/Infinity (Math.trunc(NaN)=NaN would otherwise reach the integrator as a NaN
  *  velocity that never rests -> the flight hangs every client) and an out-of-range
  *  weapon index (defense-in-depth; the engine's has_ammo already rejects it today). */
-export function sanitizeTurnInput(input: TurnInput): { angle: number; power: number; weapon: number } {
+export function sanitizeTurnInput(input: TurnInput): {
+  angle: number;
+  power: number;
+  weapon: number;
+  retreat: boolean;
+  convert: { tank: number; aiClass: number } | null;
+} {
   const clamp = (v: unknown, lo: number, hi: number): number => {
     const n = typeof v === "number" && Number.isFinite(v) ? Math.trunc(v) : lo;
     return Math.max(lo, Math.min(hi, n));
   };
+  // A convert (replace a departed player with a computer) is only meaningful as a
+  // paired convert+retreat; a bare convert would leave an AI tank waiting at AIM
+  // forever, so it is dropped unless retreat rides along.
+  const convert =
+    input.convert && typeof input.convert === "object" && input.retreat === true
+      ? {
+          tank: clamp(input.convert.tank, 0, 9), // engine max 10 tanks
+          aiClass: clamp(input.convert.aiClass, C.AI_MORON, C.AI_UNKNOWN), // never to human
+        }
+      : null;
   return {
     angle: clamp(input.angle, 0, 180),
     power: clamp(input.power, 0, 1000),
     weapon: clamp(input.weapon, 0, NUM_ITEMS - 1),
+    retreat: input.retreat === true, // strict boolean: any other shape means "fire"
+    convert,
   };
 }
 const FRAME_GUARD = 200_000; // per-advance safety bound (a turn that never resolves)
@@ -47,8 +65,13 @@ export class SimDriver {
   constructor(start: MatchStart) {
     const cfg = Object.assign(new Config(), start.cfg) as Config;
     this.gs = createGameState(cfg, start.w, start.h, start.seed);
+    let slot = 0;
     for (const s of start.order) {
-      this.gs.add_player(s.name, s.aiClass, 0, s.tankIcon);
+      // Mirrors engine_adapter: clamp aiClass (wire data) and give every slot a
+      // distinct team_id (MP is free-for-all; a shared team_id + a team-mode cfg
+      // would end every round at the first turn).
+      const ai = Number.isInteger(s.aiClass) && s.aiClass >= 0 && s.aiClass <= C.AI_UNKNOWN ? s.aiClass : 0;
+      this.gs.add_player(s.name, ai, slot++, s.tankIcon);
       this.order.push(s.deviceId);
     }
     this.gs.new_game();
@@ -92,15 +115,23 @@ export class SimDriver {
     }
   }
 
-  /** Active human commits their turn: apply aim+fire, then run to the next stop. */
+  /** Active human commits their turn: apply aim+fire (or the turn-timeout retreat),
+   *  then run to the next stop. */
   submitInput(input: TurnInput): StopReason {
     const t = this.gs.current_shooter;
     if (t) {
       const s = sanitizeTurnInput(input);
-      t.angle = s.angle;
-      t.power = s.power;
-      t.selected_weapon = s.weapon;
-      this.gs.fire(t);
+      if (s.convert && s.convert.tank < this.gs.tanks.length) {
+        this.gs.tanks[s.convert.tank].ai_class = s.convert.aiClass; // CPU replacement
+      }
+      if (s.retreat) {
+        this.gs.retreat();
+      } else {
+        t.angle = s.angle;
+        t.power = s.power;
+        t.selected_weapon = s.weapon;
+        this.gs.fire(t);
+      }
     }
     return this.advance();
   }

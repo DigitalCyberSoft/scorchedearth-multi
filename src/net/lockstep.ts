@@ -36,6 +36,13 @@ export interface TurnInput {
   power: number;
   weapon: number;
   moves: number[]; // pre-fire drive steps (engine maps these; [] for none)
+  /** True = this turn is a RETREAT (turn-timeout self-forfeit), not a shot. Riding
+   *  the numbered turn pipeline keeps it ordered and barriered on every client. */
+  retreat?: boolean;
+  /** Convert tank `tank` to computer control (host replaces a departed player).
+   *  Always paired with retreat (sanitize enforces it), so the departed player's
+   *  current turn resolves and the engine drives the tank from the next one. */
+  convert?: { tank: number; aiClass: number };
 }
 
 /** A human tank's post-shop state (everything the shop changes). Replicated so every
@@ -190,7 +197,17 @@ export class LockstepSession {
     const bucket = this.pending.get(n);
     if (!bucket) return false;
     const active = this.adapter.activeDeviceId();
-    const input = active ? bucket.get(active) : undefined;
+    if (!active) return false;
+    let input = bucket.get(active);
+    if (input === undefined) {
+      // The HOST may stand in for the active player with a RETREAT-only turn: the
+      // eviction of a dead/stuck client. Riding the numbered pipeline keeps it
+      // ordered against real turns on every client. Never a fire -- a host entry
+      // without retreat:true is ignored here, so the per-sender anti-impersonation
+      // rule still holds for every aimed shot.
+      const h = bucket.get(this.match.hostId);
+      if (h?.retreat === true) input = h;
+    }
     if (input === undefined) return false; // the active player's input hasn't arrived yet
     this.pending.delete(n); // drops the whole bucket, including any forged non-active entries
     this.turnNo = n;
@@ -294,6 +311,11 @@ export class LockstepSession {
       power: Number(raw.power) || 0,
       weapon: Number(raw.weapon) || 0,
       moves: Array.isArray(raw.moves) ? raw.moves.slice(0, MAX_MOVES) : [],
+      retreat: raw.retreat === true,
+      convert:
+        raw.convert && typeof raw.convert === "object"
+          ? { tank: Number(raw.convert.tank), aiClass: Number(raw.convert.aiClass) }
+          : undefined,
     };
     let bucket = this.pending.get(n);
     if (!bucket) {
