@@ -49,26 +49,36 @@ each turn clients exchange a world hash so divergence is caught.
    if the room fills).
 3. The host can also **Add Computer** opponents in the lobby (class *Unknown*: the
    engine rolls a random personality at first reveal). A match can even be the host
-   alone against computers.
+   alone against computers. Online computers get names in the game's own voice -
+   *Dead Meat*, *Tank-Scum*, *Tosser*, *Sucker Shot* - drawn from the shipped
+   taunt files and the AI class menu.
 4. When everyone shows connected, the host presses **Start**. Players take turns:
-   adjust angle (left/right) and power (up/down), then **Space** to fire. Idling at
-   your own turn past the countdown just **skips that turn** - your tank stays
-   alive and in the round, and play passes to the next player. A slow or
-   backgrounded browser is never treated as idle - the clock only runs once your
-   own game reaches your turn, and an unfocused window fast-forwards its
-   simulation to catch up in real time. Computer tanks taunt before firing and
-   when destroyed, as in the original. A round that never resolves on its own is
-   force-ended after 1,000 turns - the same deterministic bound on every client.
-5. If a player disconnects mid-match, their tank retreats out of the current round
-   (no kill bonus for anyone) and the host is asked whether to **replace them with
-   a computer**; the match then carries on (otherwise it ends once you are the
-   last one standing, as before).
+   adjust angle (left/right) and power (up/down), then **Space** to fire. The
+   30-second countdown starts fresh every turn; idling past it just **skips that
+   turn** - your tank stays alive and in the round, and play passes to the next
+   player. **Missing turns never costs a tank**: a hidden, throttled, or wedged
+   window only loses the turns it misses (the host skips it a few seconds past the
+   countdown). A slow browser is never treated as idle - the clock only runs once
+   your own game reaches your turn, and an unfocused window fast-forwards its
+   simulation to catch up in real time. Taunts are **on for everyone** online:
+   tanks talk before firing and when destroyed, as in the original. **Click any
+   tank** - also while you watch someone else's turn - for its info box (name,
+   class, points, shield); click elsewhere or press Esc to close it. Once no human
+   tank is left alive, the CPU-only rest of the round runs at **4x speed**. A round
+   that never resolves on its own is force-ended after 1,000 turns - the same
+   deterministic bound on every client.
+5. If a player actually leaves mid-match (tab closed, connection gone), their tank
+   retreats out of the current round (no kill bonus for anyone) and the host is
+   asked whether to **replace them with a computer**; the match then carries on
+   (otherwise it ends once you are the last one standing, as before).
 6. **Between rounds the weapon shop opens for everyone at once.** Each player shops
    their own tank; purchases are replicated to every client. The next round starts
-   when **every player has finished** (host-coordinated). There is no flat countdown:
-   a player only times out after 60 seconds of shop **inactivity** (any input resets
-   it), which then auto-submits whatever is in their cart. An absolute per-shop
-   ceiling (5 minutes) stops a hostile client from stalling the match forever.
+   when **every player has finished** (host-coordinated). While you wait, the
+   standings screen names who is still shopping and when the round will continue
+   on its own. There is no flat countdown: a player only times out after 60 seconds
+   of shop **inactivity** (any input resets it), which then auto-submits whatever
+   is in their cart. An absolute per-shop ceiling (5 minutes) stops a hostile
+   client from stalling the match forever.
 7. **Chat any time with the backquote key (`)** - in the lobby while waiting for the
    host to start, and in-game during aiming, flight, the shop, or the between-round
    wait (the lobby conversation stays on screen into the match). It is a transparent
@@ -118,6 +128,16 @@ converged (identical world hash, zero desyncs). Verified by:
   still on screen once the match begins, and all three converge after the first turn.
 - Behavioral checks for the turn-timeout skip, the disconnect retreat, and
   match-ends-on-disconnect.
+- A 7-scenario **fixes acceptance** (2 humans + 2 computers, one continuous match):
+  corpus-named computers identical on both clients with taunts forced ALL; the
+  off-turn tank info box opens and Esc closes it without leaving the match; idle
+  turns skip with the countdown returning to full every turn and nobody dying; a
+  **fully frozen guest** (no steps, no pings - a wedged tab) only loses its turns,
+  then catches up and re-converges on unfreeze; both humans retreating flips both
+  clients into the 4x CPU-only fast-forward and the round still converges; the
+  post-shop wait shows who is pending plus a live countdown and advances on its
+  own; and a guest that really closes its tab is retreated at its next turn while
+  the match carries on.
 
 Code: `src/net/{nostr,peer,signaling,match,lockstep,engine_adapter,sim_driver,metrics}.ts`,
 the lobby `src/screens_mp.ts`, and the in-game screen `src/screens_mp_game.ts`.
@@ -134,12 +154,18 @@ can never satisfy another shop's barrier. Timeouts and evictions ride the same n
 turn pipeline as shots, so they are ordered and applied at every client's own aim
 barrier: a turn timeout is a **skip turn** (lose the turn, stay in the round), enforced
 by the active player's OWN client (a slow or backgrounded browser is late, not idle);
-the host may stand in only for a client that cannot self-enforce - a skip for a stuck
-but still-connected one, a retreat/convert for a transport-dead one - never a shot.
-Behavioral tests pin that a skip kills nobody and a retreat still removes the tank
-(`test/mp_skip_solo.test.ts`). Each client
+the host may stand in only for a client that cannot self-enforce, a few seconds past
+the advertised countdown, and only ever with a skip - **heartbeat silence alone never
+forfeits a tank**. A retreat/convert stand-in is reserved for a player whose transport
+actually CLOSED (they left the match); never a shot. Behavioral tests pin the whole
+decision table (`test/mp_turn_guard.test.ts`) and that a skip kills nobody while a
+retreat still removes the tank (`test/mp_skip_solo.test.ts`). Each client
 also steps its simulation by real elapsed time (bounded), so an unfocused window whose
-rAF Chrome pauses fast-forwards to the barrier instead of crawling in slow motion. The
+rAF Chrome pauses fast-forwards to the barrier instead of crawling in slow motion; a
+1 Hz dedicated-worker tick (exempt from Chrome's intensive timer throttling, which
+clamps hidden pages' timers to 1/min) keeps a fully hidden window stepping and its
+liveness ping flowing, so it still self-skips its turns, finishes its shop, and - when
+it hosts - keeps coordinating the match. The
 host's copy of the match config is sanitized before broadcast (team mode off, sequential
 play), and every roster slot gets a distinct team id, so persisted single-player settings
 cannot collapse the round flow. Untrusted peer input is bounds-checked (angle/power/

@@ -65,6 +65,16 @@ interface MatchInit {
   relays: readonly string[];
 }
 
+/** Matches with live heartbeat duty; driven by the worker tick when rAF is stalled. */
+const _liveConns = new Set<Match>();
+
+/** Worker-tick entry (main.ts): keep every live match's datachannel liveness ping
+ *  flowing even when the page's own timers are throttled (hidden/occluded window).
+ *  Rate-limited per match by bgPing, so over-calling is harmless. */
+export function netBgTick(): void {
+  for (const m of _liveConns) m.bgPing();
+}
+
 export class Match {
   readonly role: Role;
   readonly roomKey: string;
@@ -86,6 +96,7 @@ export class Match {
   private _heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private _unsubSignaling: (() => void) | null = null;
   private _status: MatchInfo["status"] = "open";
+  private _lastPingMs = 0; // bgPing rate limit (page interval + worker tick share it)
 
   private constructor(init: MatchInit) {
     this.role = init.role;
@@ -220,8 +231,25 @@ export class Match {
     this._pruneTimer = setInterval(() => this._prune(), PRESENCE_INTERVAL_MS);
     // Datachannel liveness ping: keeps msSinceHeard() fresh for live peers so the game
     // can distinguish a wedged peer (silent) from one merely thinking on its turn.
-    this._heartbeatTimer = setInterval(() => this.peers.pingAll(), HEARTBEAT_INTERVAL_MS);
+    // The page interval is throttled to 1/min for long-hidden windows (Chrome
+    // intensive timer throttling), which used to make a merely-backgrounded player
+    // read as dead; netBgTick (worker-driven, main.ts) covers that case, and both
+    // paths rate-limit through bgPing.
+    this._heartbeatTimer = setInterval(() => this.bgPing(), HEARTBEAT_INTERVAL_MS);
+    _liveConns.add(this);
     this._emitRoster();
+  }
+
+  /** Send the liveness ping if one is due (rate-limited to HEARTBEAT_INTERVAL_MS so
+   *  the page interval and the worker tick can both call it). */
+  bgPing(): void {
+    // Test seam (?test=1): a frozen page must go silent so the harness can prove
+    // silence never kills a tank (it only skips turns).
+    if (testHooks() && (globalThis as Record<string, unknown>).__mpFrozen === true) return;
+    const now = Date.now();
+    if (now - this._lastPingMs < HEARTBEAT_INTERVAL_MS) return;
+    this._lastPingMs = now;
+    this.peers.pingAll();
   }
 
   private _onPresence(from: string, name: string, tankIcon: number): void {
@@ -302,6 +330,7 @@ export class Match {
   }
 
   leave(): void {
+    _liveConns.delete(this);
     if (this._presenceTimer) clearInterval(this._presenceTimer);
     if (this._announceTimer) clearInterval(this._announceTimer);
     if (this._pruneTimer) clearInterval(this._pruneTimer);

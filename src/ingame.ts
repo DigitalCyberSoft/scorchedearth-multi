@@ -437,7 +437,7 @@ export function handle_game_event(state: GameState, event: IngameEvent): string 
     // 3. tank body click -> info box (LEFT only; TABLE B, DOC:L538-541).  A
     //    LEFT-click off any tank dismisses an open box.
     if (_is_decrease(event)) {
-      const tank = _tank_at(state, event.pos as pygame.Point);
+      const tank = tank_at(state, event.pos as pygame.Point);
       if (tank !== null) {
         show_info_box(state, tank);
       } else if (state.info_box !== undefined && state.info_box !== null) {
@@ -653,13 +653,15 @@ export function exit_target_mode(state: GameState): void {
 
 /** The enemy tank whose body the point lands on, or null.  Mirrors the tank
  *  collision bbox (half_width wide, 0..10 tall up from the base) widened a little
- *  for a comfortable click target. */
-function _tank_at(state: GameState, pos: pygame.Point): Tank | null {
+ *  for a comfortable click target.  SP identify skips the current shooter (your
+ *  own tank is the HUD); the MP off-turn identify passes include_shooter, since
+ *  there the shooter is someone else's tank -- the one most worth inspecting. */
+export function tank_at(state: GameState, pos: pygame.Point, include_shooter = false): Tank | null {
   const x = pos[0];
   const y = pos[1];
   const shooter = state.current_shooter;
   for (const t of state.tanks) {
-    if (!t.alive || t === shooter) {
+    if (!t.alive || (!include_shooter && t === shooter)) {
       continue;
     }
     if (Math.abs(x - t.x) <= t.half_width + 4 && y - t.y >= -16 && y - t.y <= 4) {

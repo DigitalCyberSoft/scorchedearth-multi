@@ -25,6 +25,38 @@ import { testHooks } from "./net/netconfig";
 const AI_HUMAN = 0; // constants.AI_HUMAN
 const AI_UNKNOWN = 8; // constants.AI_UNKNOWN -- "random": the engine re-rolls a real class at reveal
 const MAX_MP_TANKS = 10; // engine max tanks per round (config.py MAXPLAYERS range 2-10); NOT cfg.MAXPLAYERS, which is the SP player-count setting (default 2)
+// Computer-tank names in the game's own voice: the AI class menu (Moron / Tosser /
+// Poolshark / Spoiler) and the shipped TALK1/TALK2 taunt lines ("You're dead
+// meat.", "Die, tank-scum!", "Die, Alien Swine!", "Die Commie Pig!", "Sucker
+// shot!", "Crapola.", "The fat lady sang.", "Don't worry, it isn't a live round.",
+// "Look out below!", "I shall oil my turret with your blood.", "Time to call
+// 1-900-SUE-TANK.", "Remember the Alamo!"). The host draws without replacement at
+// start and the picks ride the start order like any player name, so every client
+// sees the same roster.
+const AI_NAME_POOL: readonly string[] = [
+  "Dead Meat",
+  "Tank-Scum",
+  "Alien Swine",
+  "Commie Pig",
+  "Sucker Shot",
+  "Crapola",
+  "Fat Lady",
+  "Napalm",
+  "Banzai",
+  "Toast",
+  "Sissy",
+  "Zonk",
+  "Sue-Tank",
+  "The Alamo",
+  "Look Out",
+  "Live Round",
+  "Knock Knock",
+  "Turret Oil",
+  "Moron",
+  "Tosser",
+  "Poolshark",
+  "Spoiler",
+];
 
 export class MultiplayerScreen extends Screen {
   override opaque = true;
@@ -259,10 +291,12 @@ export class MultiplayerScreen extends Screen {
     // total is clamped to the engine's 10-tank round limit.
     const humanCount = order.length;
     const aiRoom = Math.max(0, Math.min(this.aiCount, MAX_MP_TANKS - humanCount));
+    const namePool = [...AI_NAME_POOL]; // host-picked, no replacement (pool > 10 = the AI cap)
     for (let i = 0; i < aiRoom; i++) {
+      const pick = namePool.splice(Math.floor(Math.random() * namePool.length), 1)[0] ?? `Computer ${i + 1}`;
       order.push({
         deviceId: `ai-${i + 1}`, // never a real DEVICE_ID: no client claims its turns
-        name: `Computer ${i + 1}`,
+        name: pick,
         tankIcon: (humanCount + i) % 7,
         aiClass: AI_UNKNOWN,
       });
@@ -276,13 +310,11 @@ export class MultiplayerScreen extends Screen {
     // alive and zero shots fired). PLAY_MODE: the MP loop (fire wrapper, AIM
     // barrier, turn pump) is built for SEQUENTIAL only; SYNCHRONOUS/SIMULTANEOUS
     // route the engine into SYNC_AIM/SIM_LIVE, which MP does not drive.
-    // TALKING_TANKS: default the COMPUTER taunts ON for online matches.  The
-    // engine default is OFF (oracle-locked), and most hosts have OFF persisted,
-    // so an MP room would never see the taunt system at all; map OFF -> the
-    // computers-only tier and keep an explicit ALL (host chose it in SP config).
-    const talking = String(
-      (this.cfg as unknown as Record<string, unknown>).TALKING_TANKS ?? "OFF",
-    ).toUpperCase();
+    // TALKING_TANKS: taunts are ON for everyone in online matches.  The engine
+    // default is OFF (oracle-locked) and most hosts have OFF persisted, so an MP
+    // room would never see the taunt system at all; the earlier COMPUTERS floor
+    // still muted every human kill/death line (in a human-vs-human match that is
+    // ALL of them -- reported).  Online, the taunts ARE the table talk: force ALL.
     const start: MatchStart = {
       seed,
       w: this.w,
@@ -291,7 +323,7 @@ export class MultiplayerScreen extends Screen {
         ...(this.cfg as unknown as Record<string, unknown>),
         TEAM_MODE: "NONE",
         PLAY_MODE: "SEQUENTIAL",
-        TALKING_TANKS: talking === "ALL" ? "ALL" : "COMPUTERS",
+        TALKING_TANKS: "ALL",
       },
       order,
     };

@@ -90,10 +90,10 @@ import { MultiplayerScreen } from "./screens_mp";
 // warmPublicLobby: the tank-setup screen is MODAL (no cancel, ~Done only), so the
 // discovery started at the Online Play click is always adopted by the lobby, and
 // the lobby's own cleanup releases it.
-import { warmPublicLobby } from "./net/match";
+import { warmPublicLobby, netBgTick } from "./net/match";
 import type { MpApp } from "./screens_mp_game";
 import { recordGameStart } from "./net/metrics";
-import { setRelayOverride, setTestHooks } from "./net/netconfig";
+import { setRelayOverride, setTestHooks, testHooks } from "./net/netconfig";
 
 // ===========================================================================
 // dialog zoom-wipe (main.py:33-184)
@@ -1570,9 +1570,22 @@ export async function boot(): Promise<void> {
   // propagates (the boundary already logged it) and halts the loop, surfacing the
   // crash rather than spinning a broken frame.
   let _firstFrame = true;
-  const frame = (nowMs: number): void => {
+  let _lastStepMs = 0; // wall-clock of the last app.step (rAF or worker pump)
+  let _stopped = false;
+  const pump = (nowMs: number): boolean => {
+    // Test seam (?test=1): freeze this page like a fully wedged/occluded tab (no
+    // steps, no pings -- see match.bgPing) while keeping the loops schedulable so
+    // clearing the flag resumes it. Lets the harness prove a silent-but-present
+    // player only loses turns, never the tank.
+    if (testHooks() && (globalThis as Record<string, unknown>).__mpFrozen === true) return true;
+    _lastStepMs = performance.now();
     const events = _eventQueue.splice(0, _eventQueue.length);
     const cont = app.step(nowMs, events);
+    if (!cont) _stopped = true;
+    return cont;
+  };
+  const frame = (nowMs: number): void => {
+    const cont = pump(nowMs);
     if (_firstFrame) {
       _firstFrame = false;
       _hideLoader(); // the first menu frame is on screen -> drop the preloader
@@ -1584,6 +1597,34 @@ export async function boot(): Promise<void> {
     }
   };
   requestAnimationFrame(frame);
+
+  // Background pump: Chrome stops rAF entirely for hidden/occluded windows and
+  // throttles page timers to 1/min after ~5 min hidden (intensive throttling), so a
+  // backgrounded multiplayer window used to stop stepping AND go heartbeat-silent:
+  // its turns never self-skipped, its shop never idle-finished, a hidden HOST never
+  // evaluated the shop barrier, and the silence read as a dead peer (which forfeited
+  // tanks). Dedicated-worker timers are exempt from that throttling, so a 1 Hz
+  // worker tick (a) keeps the datachannel liveness ping flowing (netBgTick) and
+  // (b) runs one app.step when no rAF frame has run recently. Pump, never frame():
+  // each frame() schedules another rAF, so calling it here would fork a second
+  // (then third, ...) rAF chain that permanently multiplies the step rate once the
+  // window is visible again.
+  try {
+    const src = "setInterval(function(){postMessage(0)},1000);";
+    const worker = new Worker(URL.createObjectURL(new Blob([src], { type: "text/javascript" })));
+    worker.onmessage = () => {
+      if (_stopped) {
+        worker.terminate();
+        return;
+      }
+      netBgTick(); // no-ops when __mpFrozen (bgPing checks) -- frozen pages stay silent
+      if (performance.now() - _lastStepMs > 1500) pump(performance.now());
+    };
+  } catch (e) {
+    // No Worker/Blob URL in this engine: background stepping degrades to the
+    // browser's throttled timers (the page still works in the foreground).
+    diag.log.warning("background pump unavailable (%s)", String(e));
+  }
 }
 
 /** The talk pools loaded at boot, exposed for the engine integrator to build the

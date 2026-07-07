@@ -83,6 +83,63 @@ export function shopBarrierReady(s: ShopBarrierState): "all_in" | "idle" | "ceil
   if (s.elapsedS >= s.ceilingS) return "ceiling";
   return null;
 }
+/** Upper bound (seconds) until the shop barrier fires ON ITS OWN -- the idle rule
+ *  if everyone still pending stays idle, capped by the absolute ceiling. Display
+ *  only (any shop activity pushes it back up). Pure: unit-tested directly. */
+export function shopWaitEta(s: {
+  pendingIdleMs: readonly number[];
+  idleLimitMs: number;
+  elapsedS: number;
+  ceilingS: number;
+}): number {
+  const idleLeftS =
+    s.pendingIdleMs.length === 0 ? 0 : Math.max(...s.pendingIdleMs.map((m) => (s.idleLimitMs - m) / 1000));
+  return Math.max(0, Math.ceil(Math.min(idleLeftS, s.ceilingS - s.elapsedS)));
+}
+
+/** Inputs to the per-frame turn-timeout guard (this client's wall clock). */
+export interface TurnGuardState {
+  myTurn: boolean;
+  isHost: boolean;
+  elapsedS: number; // seconds this client's sim has been at the current AIM turn
+  turnSeconds: number; // advertised per-turn allowance
+  graceS: number; // host stand-in slack past the allowance (covers barrier lag)
+  active: { remoteHuman: boolean; connected: boolean; silentMs: number } | null;
+  peerDeadMs: number;
+  cpuApproved: boolean; // host approved replacing the active player with a computer
+}
+
+/** What (if anything) this client commits for the current AIM turn:
+ *    "self_skip"       -- MY allowance ran out: lose my turn, nothing more.
+ *    "retreat_convert" -- host stand-in: the active player is gone/wedged and the
+ *                         host approved their computer replacement -> retreat this
+ *                         round + convert (the one race-free moment: the victim is
+ *                         active and not playing, so no competing commit exists).
+ *    "retreat"         -- host stand-in: transport CLOSED and silent past the dead
+ *                         threshold: the player LEFT the match -> forfeit the round.
+ *    "skip"            -- host stand-in: idle past allowance+grace but not
+ *                         confirmed gone -> lose the TURN, never the tank.
+ *  Missing a turn can only ever cost that turn; only a confirmed departure costs
+ *  the round. (The reported "still killing tanks that miss their turn" was the old
+ *  guard treating heartbeat SILENCE as departure -- Chrome throttles a hidden
+ *  window's timers to 1/min after ~5 min, so merely-backgrounded players went
+ *  silent and were retreated.) Pure: unit-tested directly. */
+export function turnGuard(s: TurnGuardState): "self_skip" | "retreat_convert" | "retreat" | "skip" | null {
+  if (s.myTurn) return s.elapsedS > s.turnSeconds ? "self_skip" : null;
+  if (!s.isHost || s.active === null) return null;
+  const a = s.active;
+  if (a.remoteHuman && !a.connected && a.silentMs > s.peerDeadMs) {
+    return s.cpuApproved ? "retreat_convert" : "retreat";
+  }
+  if (s.elapsedS > s.turnSeconds + s.graceS) {
+    // Wedged-but-connected (blackholed path / dead JS) with an approved
+    // replacement: convert at the same moment the skip would fire.
+    if (s.cpuApproved && a.remoteHuman && a.silentMs > s.peerDeadMs) return "retreat_convert";
+    return "skip"; // also the generic backstop for any stuck AIM turn (AI slots included)
+  }
+  return null;
+}
+
 // Stalemate backstop ONLY: a round that somehow burns this many HUMAN turns is
 // force-ended (mass_kill -> shop). The old default of 40 was reachable in an
 // honest CPU-heavy round and kicked live matches into the shop mid-fight
@@ -90,7 +147,8 @@ export function shopBarrierReady(s: ShopBarrierState): "all_in" | "idle" | "ceil
 // match. ?maxTurns still overrides for tests.
 const DEFAULT_MAX_TURNS = 1000;
 const DEFAULT_TURN_SECONDS = 30; // a turn is SKIPPED after this long idle at the OWN client's barrier
-const TURN_WALL_FACTOR = 5; // host skips a turn outliving this (x turnSeconds) wall-clock bound
+const TURN_GRACE_SECONDS = 8; // host stand-in skips this long past the allowance (the victim's own clock normally fires first)
+const FFWD_FACTOR = 4; // sim pacing with no living human tank (CPU-only endgame)
 const DROP_GRACE_SECONDS = 6; // a peer gone this long (past reconnect) ends the match
 // Real-time sim pacing: the sim normally advances one FIXED_DT per rendered frame,
 // but Chrome throttles/pauses rAF for unfocused or occluded windows, so that client
@@ -125,7 +183,7 @@ export class MpGameScreen extends Screen {
   // animating round N's end, i.e. before its own shop N initializes.
   private shopCarts = new Map<string, ShopResult & { round: number }>();
   private preShop = new Map<string, ShopResult>(); // host: deviceId -> pre-shop state
-  private hostLastActMs = new Map<string, number>(); // host: deviceId -> last sign of shopping life
+  private lastActMs = new Map<string, number>(); // deviceId -> last sign of shopping life (host's copy is the barrier authority; every client's drives the wait display)
   private pendingShopFinal: { round: number; results: Record<string, ShopResult> } | null = null;
   // ── chat overlay (transparent; shared with the lobby, so the pre-match
   //    conversation carries into the game; never touches the sim) ──
@@ -138,9 +196,9 @@ export class MpGameScreen extends Screen {
   private turnsThisRound = 0;
   private lastRound = -1;
   private lastShooter: unknown = null;
-  private turnElapsed = 0; // time on the current AIM turn (host holds it while the active peer catches up)
-  private turnWall = 0; // wall-clock on the current AIM turn (absolute TURN_WALL_FACTOR bound)
+  private turnElapsed = 0; // seconds at the current AIM turn on THIS client's sim (zeroed outside AIM)
   private turnForfeited = false;
+  private ffwd = false; // no living human tank -> sim paced at FFWD_FACTOR
   private lastRealMs: number | null = null; // real-time sim pacing (rAF-independent)
   private simDebt = 0; // real seconds the sim still owes (catch-up backlog)
   private catchingUp = false; // a buffered future turn is being burst toward
@@ -195,10 +253,10 @@ export class MpGameScreen extends Screen {
     // this network callback).
     this.session.onShopResult = (deviceId, round, inv, cash) => {
       this.shopCarts.set(deviceId, { round, inv, cash });
-      if (this.isHost) this.hostLastActMs.set(deviceId, Date.now());
+      this.lastActMs.set(deviceId, Date.now());
     };
     this.session.onShopActivity = (deviceId, round) => {
-      if (this.isHost && round === this.shopRound) this.hostLastActMs.set(deviceId, Date.now());
+      if (round === this.shopRound) this.lastActMs.set(deviceId, Date.now());
     };
     this.session.onShopFinal = (round, results) => {
       if (!this.isHost) this.pendingShopFinal = { round, results };
@@ -224,6 +282,14 @@ export class MpGameScreen extends Screen {
       g.__mpShopDone = (): boolean => {
         if (this.adapter.state()?.phase !== SHOP) return false;
         this._submitLocalCart(true);
+        return true;
+      };
+      // Commit a RETREAT for my own turn (the same wire shape a host stand-in uses).
+      // Lets the harness empty the round of humans deterministically to exercise the
+      // CPU-only fast-forward without waiting on AI marksmanship.
+      g.__mpRetreat = (): boolean => {
+        if (this.adapter.state()?.phase !== AIM || !this._isMyTurn()) return false;
+        this.session.commitTurn({ angle: 0, power: 0, weapon: 0, moves: [], retreat: true });
         return true;
       };
       // Simulate a divergent/cheating client: perturb local state so this client's next
@@ -378,6 +444,12 @@ export class MpGameScreen extends Screen {
     if (gs.phase === SHOP && this.shopStack.length > 0) {
       return this._handleShop(event);
     }
+    // Esc closes an open tank info box first (matches the SP identify window);
+    // leaving the match stays one more Esc away.
+    if (event.type === pygame.KEYDOWN && event.key === pygame.K_ESCAPE && (gs as { info_box?: unknown }).info_box) {
+      ingame.show_info_box(gs as never, null);
+      return null;
+    }
     // Esc leaves the match (the only in-game exit short of closing the tab); leaving
     // disconnects, which ends the match for the others via the drop detector.
     if (event.type === pygame.KEYDOWN && event.key === pygame.K_ESCAPE) {
@@ -393,6 +465,21 @@ export class MpGameScreen extends Screen {
     // else's tank). ingame reaches gs.fire(), which our wrapper intercepts.
     if (this._isMyTurn()) {
       ingame.handle_game_event(gs as never, event as never);
+      return null;
+    }
+    // Not my turn: the engine's input path is off, but the IDENTIFY click must
+    // still work -- online you spend most of the match watching other players'
+    // turns (in single player the box only opens during your own aim). LEFT-click
+    // a tank = its info box; LEFT-click off any tank (or Esc above) dismisses it.
+    // Display-only state: worldHash never covers info_box, so peeking at a tank
+    // cannot diverge clients.
+    if (event.type === pygame.MOUSEBUTTONDOWN && event.button === 1) {
+      const tank = ingame.tank_at(gs as never, event.pos as pygame.Point, true);
+      if (tank !== null) {
+        ingame.show_info_box(gs as never, tank as never);
+      } else if ((gs as { info_box?: unknown }).info_box) {
+        ingame.show_info_box(gs as never, null);
+      }
     }
     return null;
   }
@@ -419,7 +506,13 @@ export class MpGameScreen extends Screen {
     const nowMs = typeof performance !== "undefined" ? performance.now() : Date.now();
     const realDt = this.lastRealMs === null ? dt : (nowMs - this.lastRealMs) / 1000;
     this.lastRealMs = nowMs;
-    this.simDebt = Math.min(this.simDebt + Math.max(realDt, 0), MAX_SIM_DEBT_S);
+    // FAST-FORWARD: no living human tank (CPU-only endgame; every human is
+    // spectating) -> pace the sim at FFWD_FACTOR x real time. Pacing only: the
+    // FIXED_DT steps and the turn pipeline are untouched, and "no living human"
+    // derives from the shared deterministic state, so every client fast-forwards
+    // across the same ticks.
+    this.ffwd = !gs.tanks.some((t) => t.alive && (t as unknown as { ai_class: number }).ai_class === 0);
+    this.simDebt = Math.min(this.simDebt + Math.max(realDt, 0) * (this.ffwd ? FFWD_FACTOR : 1), MAX_SIM_DEBT_S);
     // PIPELINE catch-up: a buffered FUTURE turn is proof this client is at least
     // one full turn behind its sender -- real-time stepping alone never closes
     // that gap (it replays the backlog at 1x forever, the reported "guest lags
@@ -480,6 +573,14 @@ export class MpGameScreen extends Screen {
       turns: this.turnsThisRound,
       maxTurns: this.maxTurns,
       shooter: gs.current_shooter ? (gs.current_shooter as { name?: string }).name ?? null : null,
+      turnLeft: gs.phase === AIM ? Math.max(0, Math.ceil(this.turnSeconds - this.turnElapsed)) : null,
+      ffwd: this.ffwd,
+      tankNames: gs.tanks.map((t) => (t as unknown as { name: string }).name),
+      tanksAlive: gs.tanks.map((t) => t.alive),
+      tankPx: gs.tanks.map((t) => [Math.trunc(t.x), Math.trunc(t.y)]),
+      infoBox: (gs as { info_box?: unknown }).info_box ? true : false,
+      talking: String((gs.cfg as unknown as { TALKING_TANKS?: unknown }).TALKING_TANKS ?? ""),
+      shopEta: gs.phase === SHOP ? this._shopEtaSeconds() : null,
     };
     return null;
   }
@@ -494,21 +595,27 @@ export class MpGameScreen extends Screen {
       this.forceEnded = false;
       this.proceeded = false;
     }
-    if (gs.phase === AIM) {
-      const cs = gs.current_shooter as unknown;
-      if (cs && cs !== this.lastShooter) {
-        this.lastShooter = cs;
-        this.turnsThisRound++;
-        this.turnElapsed = 0; // new turn -> reset the host turn-timeout clock
-        this.turnWall = 0;
-        this.turnForfeited = false;
-      }
-      // Deterministic round bound: identical synced turn count on every client, so
-      // each force-ends the round at the same point with NO message.
-      if (!this.forceEnded && this.turnsThisRound > this.maxTurns) {
-        this.forceEnded = true;
-        gs.mass_kill();
-      }
+    // The round is only bounded while it is LIVE (the AIM gate used to imply this).
+    if (gs.phase === ROUND_END || gs.phase === SHOP || gs.phase === GAME_OVER) return;
+    // Count every shooter hand-off in ANY playing phase: an AI turn can run
+    // TURN_START -> FIRING without a single AIM step, so gating this on AIM
+    // undercounted CPU-only endgames to ~0 turns and the stalemate cap below
+    // never fired -- a two-computer stalemate then fast-forwarded forever instead
+    // of reaching the shop (probe: shooters alternating, hash changing, turns
+    // frozen at 3). Counting is per sim step, so every client sees the same
+    // hand-offs at the same steps.
+    const cs = gs.current_shooter as unknown;
+    if (cs && cs !== this.lastShooter) {
+      this.lastShooter = cs;
+      this.turnsThisRound++;
+      this.turnElapsed = 0; // new turn -> fresh countdown (also zeroed outside AIM in _realtimeGuards)
+      this.turnForfeited = false;
+    }
+    // Deterministic round bound: identical synced turn count on every client, so
+    // each force-ends the round at the same point with NO message.
+    if (!this.forceEnded && this.turnsThisRound > this.maxTurns) {
+      this.forceEnded = true;
+      gs.mass_kill();
     }
   }
 
@@ -565,57 +672,64 @@ export class MpGameScreen extends Screen {
       this.droppedFor = 0;
     }
     // Every client advances the turn clock so the ACTIVE player sees their own
-    // countdown. Timeouts and evictions ride the numbered turn pipeline:
-    //   - Turn timeout = SKIP THE TURN, nothing more: the tank stays alive and in
-    //     the round, play passes to the next shooter. SELF-enforced: the active
-    //     player's own client commits the skip when ITS clock expires. Its clock
-    //     starts when ITS sim reaches the turn, so a slow/backgrounded client is
-    //     never skipped for being late -- only for being idle at its own barrier.
-    //   - The HOST stands in only for an active player who cannot self-enforce:
-    //     DEAD (transport-silent past PEER_DEAD_MS; merely throttled windows keep
-    //     heartbeating) commits a RETREAT -- the player left, forfeit the round
-    //     (and convert to a computer if the host approved replacement). STUCK
-    //     (turnWall: heartbeating but never advancing, e.g. a wedged tab that
-    //     cannot run its own clock) commits a SKIP -- still connected players
-    //     never lose more than the turn. tryPump accepts a host stand-in only
-    //     with skip/retreat set, never a fire. If the victim revives and fires in
-    //     the same instant, the hash check flags the divergence and both sides
-    //     degrade to solo play (_goSolo).
+    // countdown. Timeouts and evictions ride the numbered turn pipeline; the
+    // decision itself is turnGuard (pure, unit-tested):
+    //   - the active player's own client SELF-skips at turnSeconds (its clock
+    //     starts when ITS sim reaches the turn, so a slow client is never skipped
+    //     for being late -- only for being idle at its own barrier);
+    //   - the host stands in past turnSeconds+grace with a SKIP (lose the turn,
+    //     never the tank -- covers hidden/wedged windows that cannot run their own
+    //     clock), and with a RETREAT only for a player whose transport CLOSED
+    //     (left the match), converting to a computer when the host approved it.
+    //   tryPump accepts a host stand-in only with skip/retreat set, never a fire.
+    //   If the victim revives and fires in the same instant, turn-window ordering
+    //   drops the loser; a real divergence trips the hash check -> _goSolo.
     if (gs.phase === AIM && !this.turnForfeited) {
       this.turnElapsed += dt;
-      this.turnWall += dt;
-      const skipTurn = { angle: 0, power: 0, weapon: 0, moves: [], skip: true };
-      if (this._isMyTurn()) {
-        if (this.turnElapsed > this.turnSeconds) {
-          this.turnForfeited = true;
-          this.session.commitTurn(skipTurn);
-        }
-      } else if (this.isHost) {
-        const activeId = this.adapter.activeDeviceId();
-        // humanDeviceIds guard: an AI slot has a deviceId but no peer, so
-        // msSinceHeard would read Infinity and instantly evict an AI turn.
-        const activeRemoteHuman = activeId !== null && this.adapter.humanDeviceIds().includes(activeId);
-        const activeDead = activeRemoteHuman && this.session.match.msSinceHeard(activeId) > PEER_DEAD_MS;
-        if (activeDead) {
-          this.turnForfeited = true;
-          // If the host approved CPU replacement for this departed player, convert
-          // their tank as part of the eviction. This is the ONE race-free moment:
-          // the victim is the active player and is dead, so no client can commit a
-          // competing turn while the host stands in.
+      const activeId = this.adapter.activeDeviceId();
+      const roster = activeId !== null ? players.find((p) => p.deviceId === activeId) : undefined;
+      const verdict = turnGuard({
+        myTurn: this._isMyTurn(),
+        isHost: this.isHost,
+        elapsedS: this.turnElapsed,
+        turnSeconds: this.turnSeconds,
+        graceS: TURN_GRACE_SECONDS,
+        active:
+          activeId === null
+            ? null
+            : {
+                // humanDeviceIds guard: an AI slot has a deviceId but no peer, so
+                // msSinceHeard reads Infinity and must never count as a departure.
+                remoteHuman: activeId !== DEVICE_ID && this.adapter.humanDeviceIds().includes(activeId),
+                connected: roster?.connected ?? false,
+                silentMs: this.session.match.msSinceHeard(activeId),
+              },
+        peerDeadMs: PEER_DEAD_MS,
+        cpuApproved: activeId !== null && this.cpuReplace.has(activeId),
+      });
+      if (verdict !== null) {
+        this.turnForfeited = true;
+        if (verdict === "self_skip" || verdict === "skip") {
+          this.session.commitTurn({ angle: 0, power: 0, weapon: 0, moves: [], skip: true });
+        } else {
           const retreatTurn = { angle: 0, power: 0, weapon: 0, moves: [], retreat: true };
           const idx = activeId !== null ? this.adapter.deviceIds().indexOf(activeId) : -1;
-          if (activeId !== null && idx >= 0 && this.cpuReplace.has(activeId)) {
+          if (verdict === "retreat_convert" && activeId !== null && idx >= 0) {
             this.cpuReplace.delete(activeId);
             this.session.commitTurn({ ...retreatTurn, convert: { tank: idx, aiClass: 8 } }); // AI_UNKNOWN
           } else {
             this.session.commitTurn(retreatTurn);
           }
-        } else if (this.turnWall > this.turnSeconds * TURN_WALL_FACTOR) {
-          // Stuck but still heartbeating: hasn't disconnected, so lose the turn only.
-          this.turnForfeited = true;
-          this.session.commitTurn(skipTurn);
         }
       }
+    } else if (gs.phase !== AIM) {
+      // Between turns (flight/settle/shop/...) the turn clock is meaningless. Zero
+      // it here -- not only at the shooter change in _trackTurns -- so every new
+      // turn's countdown starts at the full allowance no matter how the previous
+      // turn ended (the reported "timer doesn't reset to 30" was this clock
+      // surviving into the next turn's display).
+      this.turnElapsed = 0;
+      this.turnForfeited = false;
     }
   }
 
@@ -654,11 +768,11 @@ export class MpGameScreen extends Screen {
       this.shopfinApplied = false;
       this.shopStack = [];
       this.preShop.clear();
-      this.hostLastActMs.clear();
-      if (this.isHost) {
-        const now = Date.now();
-        for (const d of this.adapter.humanDeviceIds()) {
-          this.hostLastActMs.set(d, now); // every idle clock starts at shop open
+      this.lastActMs.clear();
+      const now = Date.now();
+      for (const d of this.adapter.humanDeviceIds()) {
+        this.lastActMs.set(d, now); // every idle clock starts at shop open (all clients: the wait display needs it too)
+        if (this.isHost) {
           const s = this.adapter.shopSnapshot(d);
           if (s) this.preShop.set(d, s);
         }
@@ -710,7 +824,7 @@ export class MpGameScreen extends Screen {
       const why = shopBarrierReady({
         humans,
         submitted: new Set(humans.filter((d) => this.shopCarts.get(d)?.round === this.shopRound)),
-        idleMsOf: (d) => now - (this.hostLastActMs.get(d) ?? now),
+        idleMsOf: (d) => now - (this.lastActMs.get(d) ?? now),
         idleLimitMs: (this.shopSeconds + SHOP_GRACE_SECONDS) * 1000,
         elapsedS: this.shopElapsed,
         ceilingS: this.shopCeiling,
@@ -741,27 +855,40 @@ export class MpGameScreen extends Screen {
     if (!snap) return;
     this.shopCarts.set(DEVICE_ID, { round: this.shopRound, inv: snap.inv, cash: snap.cash });
     this.session.sendShop(this.shopRound, snap.inv, snap.cash);
-    if (this.isHost) this.hostLastActMs.set(DEVICE_ID, Date.now());
+    this.lastActMs.set(DEVICE_ID, Date.now());
   }
 
   /** Local shop input: reset the idle clock; guests also (throttled) broadcast a
    *  "still shopping" keepalive so the host's independent idle rule stays fresh. */
   private _noteShopActivity(): void {
     this.shopIdle = 0;
-    if (this.isHost) {
-      this.hostLastActMs.set(DEVICE_ID, Date.now());
-    } else if (this.shopActAge >= SHOP_ACT_INTERVAL_SECONDS) {
+    this.lastActMs.set(DEVICE_ID, Date.now());
+    if (!this.isHost && this.shopActAge >= SHOP_ACT_INTERVAL_SECONDS) {
       this.shopActAge = 0;
       this.session.sendShopActivity(this.shopRound);
     }
   }
 
-  /** Humans whose cart for the CURRENT shop has not been seen locally (display). */
+  /** Humans whose cart for the CURRENT shop has not been seen locally. */
+  private _pendingIds(): string[] {
+    return this.adapter.humanDeviceIds().filter((d) => this.shopCarts.get(d)?.round !== this.shopRound);
+  }
+
   private _pendingNames(): string[] {
-    return this.adapter
-      .humanDeviceIds()
-      .filter((d) => this.shopCarts.get(d)?.round !== this.shopRound)
-      .map((d) => this._nameOf(d));
+    return this._pendingIds().map((d) => this._nameOf(d));
+  }
+
+  /** Display: seconds until the shop advances by itself if the pending players stay
+   *  idle (their activity keepalives push it back up). Every client tracks
+   *  lastActMs from the same broadcasts, so guests estimate what the host enforces. */
+  private _shopEtaSeconds(): number {
+    const now = Date.now();
+    return shopWaitEta({
+      pendingIdleMs: this._pendingIds().map((d) => now - (this.lastActMs.get(d) ?? now)),
+      idleLimitMs: (this.shopSeconds + SHOP_GRACE_SECONDS) * 1000,
+      elapsedS: this.shopElapsed,
+      ceilingS: this.shopCeiling,
+    });
   }
 
   private _nameOf(deviceId: string): string {
@@ -769,23 +896,25 @@ export class MpGameScreen extends Screen {
     return p ? p.name : deviceId.slice(0, 6);
   }
 
+  /** One top-center notice line (dark backing, bold); returns the next y. */
+  private _noteAt(surf: pygame.Surface, y: number, msg: string, color: [number, number, number]): number {
+    const f = W.font(16, true);
+    const r = f.render(msg, true, color);
+    const x = Math.trunc((this.app.w - r.get_width()) / 2);
+    const ov = new pygame.Surface([r.get_width() + 16, r.get_height() + 10], pygame.SRCALPHA);
+    ov.fill([0, 0, 0, 130]);
+    surf.blit(ov, [x - 8, y - 5]);
+    surf.blit(r, [x, y]);
+    return y + r.get_height() + 14;
+  }
+
   /** Top-center notices: the host's CPU-replacement prompt and a detected desync.
    *  Drawn over gameplay AND the shop (below the engine HUD). */
   private _drawNotices(surf: pygame.Surface): void {
     let y = 46;
-    const note = (msg: string, color: [number, number, number]): void => {
-      const f = W.font(16, true);
-      const r = f.render(msg, true, color);
-      const x = Math.trunc((this.app.w - r.get_width()) / 2);
-      const ov = new pygame.Surface([r.get_width() + 16, r.get_height() + 10], pygame.SRCALPHA);
-      ov.fill([0, 0, 0, 130]);
-      surf.blit(ov, [x - 8, y - 5]);
-      surf.blit(r, [x, y]);
-      y += r.get_height() + 14;
-    };
-    if (this.cpuOffer) note(`${this.cpuOffer.name} disconnected -- Y: replace with computer  N: don't`, [255, 210, 120]);
-    if (this.solo) note(this.solo, [255, 210, 120]);
-    else if (this.desyncNote) note(this.desyncNote, [255, 120, 110]);
+    if (this.cpuOffer) y = this._noteAt(surf, y, `${this.cpuOffer.name} disconnected -- Y: replace with computer  N: don't`, [255, 210, 120]);
+    if (this.solo) this._noteAt(surf, y, this.solo, [255, 210, 120]);
+    else if (this.desyncNote) this._noteAt(surf, y, this.desyncNote, [255, 120, 110]);
   }
 
   private _drawChat(surf: pygame.Surface): void {
@@ -873,21 +1002,31 @@ export class MpGameScreen extends Screen {
         // the local auto-finish.
         for (const s of this.shopStack) s.draw(surf);
         const idleLeft = Math.ceil(this.shopSeconds - this.shopIdle);
+        const pendingIds = this._pendingIds();
+        const lastOne = pendingIds.length === 1 && pendingIds[0] === DEVICE_ID;
         const msg =
           idleLeft <= 15
             ? `idle -- shop auto-finishes in ${Math.max(0, idleLeft)}s (any input resets)`
-            : "~Done to finish  -  ` to chat";
-        center(fs.render(msg, true, idleLeft <= 15 ? [255, 180, 120] : [235, 235, 235]), this.app.h - 22);
+            : lastOne
+              ? "everyone else is done -- they are waiting for you (~Done finishes)"
+              : "~Done to finish  -  ` to chat";
+        center(fs.render(msg, true, idleLeft <= 15 || lastOne ? [255, 180, 120] : [235, 235, 235]), this.app.h - 22);
         this._drawChat(surf);
         this._drawNotices(surf);
         return;
       }
       // Shopping done (or no shop for me): standings while the others finish. The
-      // round advances when everyone is done (host-controlled), NOT on a countdown.
+      // round advances when everyone is done (host-controlled); the notice says WHO
+      // is still shopping and when the idle rule advances it anyway (reported: this
+      // wait looked like a hang without it).
       const remain = Math.max(0, ((gs.cfg as { MAXROUNDS?: number }).MAXROUNDS ?? 0) - gs.round_index);
       ui.draw_rankings(surf, this.app.renderer as never, gs as never, "Standings", remain);
       const pending = this._pendingNames();
-      const msg = pending.length > 0 ? `waiting for ${pending.join(", ")}  -  \` to chat` : "starting next round...";
+      if (pending.length > 0) {
+        const eta = this._shopEtaSeconds();
+        this._noteAt(surf, this.app.h - 84, `Waiting for ${pending.join(", ")} to finish shopping (continues in <=${eta}s)`, [255, 210, 120]);
+      }
+      const msg = pending.length > 0 ? "` to chat while you wait" : "starting next round...";
       center(fs.render(msg, true, [235, 235, 235]), this.app.h - 40);
       this._drawConnSummary(surf, fs);
       this._drawChat(surf);
@@ -901,14 +1040,17 @@ export class MpGameScreen extends Screen {
     // on the player, we are replaying our own backlog to reach their turn.
     const turnTxt = mine
       ? "YOUR TURN"
-      : this.catchingUp
-        ? "catching up..."
-        : `waiting for ${(gs.current_shooter as { name?: string } | null)?.name ?? "..."}`;
+      : this.ffwd
+        ? `fast forward x${FFWD_FACTOR} -- computers finishing the round`
+        : this.catchingUp
+          ? "catching up..."
+          : `waiting for ${(gs.current_shooter as { name?: string } | null)?.name ?? "..."}`;
     surf.blit(f.render(turnTxt, true, mine ? [120, 255, 140] : [230, 230, 140]), [12, by]);
     if (this.banner) surf.blit(fs.render(this.banner, true, [180, 220, 255]), [12, by + 22]);
     // Turn countdown shown to EVERY client (the active player most needs it: at
-    // zero their own client skips the turn). Solo has no timeout, so no countdown.
-    if (gs.phase === AIM && !this.solo) {
+    // zero their own client skips the turn). Solo has no timeout, and the CPU-only
+    // fast-forward needs no human countdown, so neither draws one.
+    if (gs.phase === AIM && !this.solo && !this.ffwd) {
       const left = Math.max(0, Math.ceil(this.turnSeconds - this.turnElapsed));
       surf.blit(fs.render(`turn ${left}s`, true, left <= 5 ? [255, 160, 120] : [200, 200, 200]), [12, by - 20]);
     }

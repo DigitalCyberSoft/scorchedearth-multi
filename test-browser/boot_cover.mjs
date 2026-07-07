@@ -26,7 +26,7 @@ import { writeFileSync, mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-const require = createRequire("/home/user/Scorched Earth/scorch-html5/package.json");
+const require = createRequire("/home/user/Scorched Earth/scorchedearth-multi/package.json");
 const { chromium } = require("playwright");
 
 const HERE = dirname(fileURLToPath(import.meta.url));

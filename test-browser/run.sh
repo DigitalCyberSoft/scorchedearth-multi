@@ -15,7 +15,7 @@
 #         blank canvas, a pageerror, or the server failed to come up.
 set -uo pipefail
 
-ROOT="/home/user/Scorched Earth/scorch-html5"
+ROOT="/home/user/Scorched Earth/scorchedearth-multi"
 PORT="${TB_PORT:-4188}"
 cd "$ROOT"
 
