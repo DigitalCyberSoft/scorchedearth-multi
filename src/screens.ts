@@ -590,8 +590,9 @@ export class MainMenuScreen extends Screen {
     // 1. ~Start (tag 0) -> begin game
     p.add(new Button(x, y, "~Start", "start_game", null, true));
     y += dy;
-    // 1b. ~Multiplayer -> the P2P lobby (fork addition; not in the original menu).
-    p.add(new Button(x, y, "~Multiplayer", "multiplayer"));
+    // 1b. Online Play -> the P2P lobby (fork addition; not in the original menu).
+    // Accel 'n' (not 'o'/'p'): 'S~ound' owns 'o' and '~Players:' owns 'p' here.
+    p.add(new Button(x, y, "O~nline Play", "multiplayer"));
     y += dy;
     // 2. ~Players: inline spinner (range 2-10, cfg MAXPLAYERS)
     _num_spinner(p, x, y, this.cfg, "MAXPLAYERS", "~Players:", 2, 10, 1, String, 250);

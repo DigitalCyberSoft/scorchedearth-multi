@@ -75,7 +75,7 @@ export class MultiplayerScreen extends Screen {
   }
 
   private _build(): Panel {
-    const p = new Panel(40, 40, 360, this.h - 110, "Multiplayer", true);
+    const p = new Panel(40, 40, 360, this.h - 110, "Online Play", true);
     const x = p.rect.x + 18;
     let y = p.rect.y + 36;
     const dy = 30;
