@@ -15,7 +15,7 @@ import type { ScreenAction, ScreenEvent } from "./screen";
 import type { Config } from "./config";
 import { DEVICE_ID } from "./net/identity";
 import { connectedRelays } from "./net/nostr";
-import { Match, listPublicMatches, type MatchInfo, type RoomPlayer, type Role } from "./net/match";
+import { Match, adoptPublicLobby, releasePublicLobby, type MatchInfo, type RoomPlayer, type Role } from "./net/match";
 import { LockstepSession, type MatchStart, type PlayerSlot } from "./net/lockstep";
 import { createEngineAdapter, type GameEngineAdapter } from "./net/engine_adapter";
 import { MpGameScreen, type MpApp } from "./screens_mp_game";
@@ -45,7 +45,6 @@ export class MultiplayerScreen extends Screen {
   private readonly adapter: GameEngineAdapter = createEngineAdapter();
   private roster: RoomPlayer[] = [];
   private publicMatches: MatchInfo[] = [];
-  private unsubList: (() => void) | null = null;
   private started = false;
   private aiCount = 0; // host-staged computer opponents (default class Unknown)
   private chat: ChatOverlay | null = null; // room chat (created with the match; carried into the game)
@@ -66,7 +65,19 @@ export class MultiplayerScreen extends Screen {
     this.h = h;
     this.myName = myName;
     this.myTankIcon = tankIcon;
+    // Adopt the discovery stream the Online Play click already started (relays
+    // connected + public-match subscription live since the setup screen): the
+    // list opens pre-populated and stays live without a manual refresh.
+    this.publicMatches = adoptPublicLobby((ms) => {
+      this.publicMatches = ms;
+      this._rebuild();
+    });
+    this.status =
+      this.publicMatches.length > 0
+        ? "Public games (live):"
+        : "Searching for public games... Create or join a match.";
     this.panel = this._build();
+    this._emitLobbyHook();
   }
 
   /** Once the engine state exists (host after Start; guest after the "start"
@@ -117,6 +128,18 @@ export class MultiplayerScreen extends Screen {
 
   private _rebuild(): void {
     this.panel = this._build();
+    this._emitLobbyHook();
+  }
+
+  /** test telemetry (harness only, ?test=1): the lobby list as rendered. */
+  private _emitLobbyHook(): void {
+    if (testHooks())
+      (globalThis as Record<string, unknown>).__mpLobby = {
+        matches: this.publicMatches.length,
+        names: this.publicMatches.map((m) => m.name),
+        status: this.status,
+        relays: connectedRelays().length,
+      };
   }
 
   override handle(e: ScreenEvent): ScreenAction {
@@ -202,13 +225,16 @@ export class MultiplayerScreen extends Screen {
     this._rebuild();
   }
 
-  private async _list(): Promise<void> {
-    this.unsubList?.();
-    this.status = "Public games (live):";
-    this.unsubList = await listPublicMatches((ms) => {
+  private _list(): void {
+    // Manual refresh: restart the live discovery with a fresh seen-set (drops
+    // any entry whose announcer went away without expiring).
+    releasePublicLobby();
+    this.publicMatches = adoptPublicLobby((ms) => {
       this.publicMatches = ms;
       this._rebuild();
     });
+    this.status = "Public games (live):";
+    this._rebuild();
   }
 
   private _start(): void {
@@ -341,8 +367,7 @@ export class MultiplayerScreen extends Screen {
   }
 
   private _cleanup(): void {
-    this.unsubList?.();
-    this.unsubList = null;
+    releasePublicLobby();
     this.match?.leave();
     this.match = null;
     this.session = null;

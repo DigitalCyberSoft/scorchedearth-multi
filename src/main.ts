@@ -87,6 +87,10 @@ import { setSpritesProvider as setRenderSprites } from "./render";
 import { createGameState, setMtnRanges } from "./game";
 import * as sprites from "./sprites";
 import { MultiplayerScreen } from "./screens_mp";
+// warmPublicLobby: the tank-setup screen is MODAL (no cancel, ~Done only), so the
+// discovery started at the Online Play click is always adopted by the lobby, and
+// the lobby's own cleanup releases it.
+import { warmPublicLobby } from "./net/match";
 import type { MpApp } from "./screens_mp_game";
 import { recordGameStart } from "./net/metrics";
 import { setRelayOverride, setTestHooks } from "./net/netconfig";
@@ -809,6 +813,9 @@ export class App {
       this._start_setup();
     } else if (action === "multiplayer") {
       // Pre-lobby: pick name + tank on the real tank-setup screen, THEN enter the lobby.
+      // Start the relay connections + public-match discovery NOW, so the lobby
+      // opens with live results instead of an empty list behind a manual refresh.
+      warmPublicLobby();
       this._mp_setup = true;
       this.push(new TankInitScreen(this.cfg as unknown as never, this.w, this.h, 0) as unknown as StackScreen);
     } else if (action === "save_changes") {

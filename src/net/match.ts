@@ -17,9 +17,10 @@ import {
   ANNOUNCE_TTL_MS,
   HEARTBEAT_INTERVAL_MS,
   PROTOCOL_VERSION,
+  testHooks,
 } from "./netconfig";
 import { DEVICE_ID, uid } from "./identity";
-import { generateRoomKey, publishReplaceable, subscribeReplaceable } from "./nostr";
+import { ensureRelays, generateRoomKey, publishReplaceable, subscribeReplaceable } from "./nostr";
 import { subscribeSignaling, sendPresence } from "./signaling";
 import { PeerManager, type ConnState } from "./peer";
 
@@ -339,4 +340,54 @@ export async function listPublicMatches(onUpdate: (matches: MatchInfo[]) => void
     clearInterval(tick);
     unsub();
   };
+}
+
+// ── Eager lobby warmup (Online Play click -> discovery starts immediately) ────
+//
+// The lobby list used to start only at the manual "Refresh Public Games" click,
+// AFTER the player had typed a name on the setup screen -- so the first thing a
+// joiner saw was an empty list. warmPublicLobby() is called the moment the
+// Online Play menu item is chosen: it opens the relay websockets and starts the
+// public-match subscription while the player is still on the tank-setup screen.
+// The lobby screen then ADOPTS the warm stream (matches seen so far + live
+// updates); releasePublicLobby() stops it when the setup is cancelled or the
+// lobby closes.
+
+type WarmLobby = { unsub: () => void; matches: MatchInfo[] };
+let _warm: WarmLobby | null = null;
+let _warmHook: ((ms: MatchInfo[]) => void) | null = null;
+
+/** Connect the relay pool and start public-match discovery NOW. Idempotent. */
+export function warmPublicLobby(): void {
+  if (_warm) return;
+  const w: WarmLobby = { unsub: () => {}, matches: [] };
+  _warm = w;
+  ensureRelays(activeRelays()); // open the websockets before any publish/subscribe
+  void listPublicMatches((ms) => {
+    w.matches = ms;
+    if (_warm === w) _warmHook?.(ms);
+    // test telemetry (harness only, ?test=1): proves discovery ran while the
+    // player was still on the setup screen, before the lobby existed.
+    if (testHooks())
+      (globalThis as Record<string, unknown>).__mpWarm = { matches: ms.length, names: ms.map((m) => m.name) };
+  }).then((unsub) => {
+    if (_warm === w) w.unsub = unsub;
+    else unsub(); // released while the subscription was still opening
+  });
+}
+
+/** Adopt the warm discovery: re-points the update stream at `onUpdate` and
+ *  returns the matches already seen. Starts the warmup if it was never begun
+ *  (a path that skipped the Online Play menu item). */
+export function adoptPublicLobby(onUpdate: (ms: MatchInfo[]) => void): MatchInfo[] {
+  warmPublicLobby();
+  _warmHook = onUpdate;
+  return _warm ? _warm.matches.slice() : [];
+}
+
+/** Stop the warm discovery and drop its hook (setup cancelled / lobby closed). */
+export function releasePublicLobby(): void {
+  _warmHook = null;
+  _warm?.unsub();
+  _warm = null;
 }
