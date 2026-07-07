@@ -36,8 +36,12 @@ export interface TurnInput {
   power: number;
   weapon: number;
   moves: number[]; // pre-fire drive steps (engine maps these; [] for none)
-  /** True = this turn is a RETREAT (turn-timeout self-forfeit), not a shot. Riding
-   *  the numbered turn pipeline keeps it ordered and barriered on every client. */
+  /** True = SKIP this turn (turn-timeout): no shot, the tank stays alive and in
+   *  the round; play passes to the next shooter. Riding the numbered turn
+   *  pipeline keeps it ordered and barriered on every client. */
+  skip?: boolean;
+  /** True = this turn is a RETREAT (a DISCONNECTED player forfeits the round),
+   *  not a shot. Same pipeline ordering as skip. */
   retreat?: boolean;
   /** Convert tank `tank` to computer control (host replaces a departed player).
    *  Always paired with retreat (sanitize enforces it), so the departed player's
@@ -112,6 +116,7 @@ export class LockstepSession {
   private pending = new Map<number, Map<string, TurnInput>>();
   private myHashes = new Map<number, string>();
   private peerHashes = new Map<number, Map<string, string>>();
+  private detached = false; // post-desync solo: game traffic dead, chat stays live
   onDesync: ((turn: number, peer: string) => void) | null = null;
   onTurnApplied: ((turn: number) => void) | null = null;
   /** Out-of-band match-control messages (round/shop transitions, timers), used by
@@ -152,9 +157,23 @@ export class LockstepSession {
 
   /** Active player: lock in this turn's input and broadcast it. */
   commitTurn(input: TurnInput): void {
+    if (this.detached) {
+      // Solo continuation: never broadcast a turn from a diverged world. Apply
+      // locally so a caller that missed the solo branch still advances the game.
+      this.adapter.applyTurnInput(input);
+      return;
+    }
     const n = ++this.turnNo;
     this.match.broadcast({ t: "turn", n, from: DEVICE_ID, input } satisfies Wire);
     this._applyTurn(n, input);
+  }
+
+  /** Leave lockstep but keep the transport: after a detected desync the worlds have
+   *  diverged, so game messages (turns/hashes/shop/ctrl) are dead in BOTH directions
+   *  and buffered turns are flushed. Chat still flows -- text is world-independent. */
+  detach(): void {
+    this.detached = true;
+    this.pending.clear();
   }
 
   /** Whose turn it is, per the local (converged) engine state. */
@@ -162,23 +181,34 @@ export class LockstepSession {
     return this.adapter.activeDeviceId();
   }
 
+  /** True when a FUTURE turn sits in the buffer -- proof this client is at least
+   *  one full turn behind its sender. The screen bursts the sim until it drains
+   *  (pipeline catch-up); a detached session cleared the buffer and stays false. */
+  hasBuffered(): boolean {
+    return this.pending.size > 0;
+  }
+
   /** Broadcast an out-of-band control message (host-driven round/shop coordination). */
   sendControl(kind: string, data?: unknown): void {
+    if (this.detached) return;
     this.match.broadcast({ t: "ctrl", kind, data } satisfies Wire);
   }
 
   /** A player broadcasts its own finalized shop cart (self-only; the host aggregates). */
   sendShop(round: number, inv: number[], cash: number): void {
+    if (this.detached) return;
     this.match.broadcast({ t: "shop", from: DEVICE_ID, round, inv, cash } satisfies Wire);
   }
 
   /** A player broadcasts "I am actively shopping" (screen throttles the cadence). */
   sendShopActivity(round: number): void {
+    if (this.detached) return;
     this.match.broadcast({ t: "shopact", from: DEVICE_ID, round } satisfies Wire);
   }
 
   /** Host broadcasts the authoritative post-shop state for every human tank. */
   sendShopFinal(round: number, results: Record<string, ShopResult>): void {
+    if (this.detached) return;
     this.match.broadcast({ t: "shopfin", round, results } satisfies Wire);
   }
 
@@ -193,6 +223,7 @@ export class LockstepSession {
    *  order at the same state even though they animate flight at different rates.
    *  Returns true if a turn was applied. */
   tryPump(): boolean {
+    if (this.detached) return false;
     const n = this.turnNo + 1;
     const bucket = this.pending.get(n);
     if (!bucket) return false;
@@ -200,13 +231,13 @@ export class LockstepSession {
     if (!active) return false;
     let input = bucket.get(active);
     if (input === undefined) {
-      // The HOST may stand in for the active player with a RETREAT-only turn: the
-      // eviction of a dead/stuck client. Riding the numbered pipeline keeps it
-      // ordered against real turns on every client. Never a fire -- a host entry
-      // without retreat:true is ignored here, so the per-sender anti-impersonation
-      // rule still holds for every aimed shot.
+      // The HOST may stand in for the active player with a SKIP (stuck client:
+      // lose the turn only) or RETREAT (dead client: forfeit the round) turn.
+      // Riding the numbered pipeline keeps it ordered against real turns on every
+      // client. Never a fire -- a host entry with neither flag is ignored here, so
+      // the per-sender anti-impersonation rule still holds for every aimed shot.
       const h = bucket.get(this.match.hostId);
-      if (h?.retreat === true) input = h;
+      if (h?.retreat === true || h?.skip === true) input = h;
     }
     if (input === undefined) return false; // the active player's input hasn't arrived yet
     this.pending.delete(n); // drops the whole bucket, including any forged non-active entries
@@ -218,6 +249,9 @@ export class LockstepSession {
   private _onWire(peerId: string, raw: unknown): void {
     const msg = raw as Wire;
     if (!msg || typeof (msg as { t?: unknown }).t !== "string") return;
+    // Detached (solo after a desync): every game message is from a diverged world;
+    // only chat is still meaningful.
+    if (this.detached && msg.t !== "chat") return;
     switch (msg.t) {
       case "start":
         // Host-authoritative and once-only. peerId is the authenticated far end of the
@@ -235,7 +269,10 @@ export class LockstepSession {
         break;
       case "hash":
         // Only the channel's own peer may report its hash (no impersonation).
-        if (this.role === "host" && msg.from === peerId) this._recordHash(msg.n, msg.from, msg.hash);
+        // EVERY client compares (host included, since everyone broadcasts): a
+        // guest in a 2-player match must be able to detect the divergence too,
+        // or only the host would ever degrade to solo play.
+        if (msg.from === peerId) this._recordHash(msg.n, msg.from, msg.hash);
         break;
       case "snap":
         if (this.role === "guest" && peerId === this.match.hostId) this.adapter.restore(msg.snap);
@@ -311,6 +348,7 @@ export class LockstepSession {
       power: Number(raw.power) || 0,
       weapon: Number(raw.weapon) || 0,
       moves: Array.isArray(raw.moves) ? raw.moves.slice(0, MAX_MOVES) : [],
+      skip: raw.skip === true,
       retreat: raw.retreat === true,
       convert:
         raw.convert && typeof raw.convert === "object"
@@ -330,11 +368,22 @@ export class LockstepSession {
     const h = this.adapter.worldHash();
     this.myHashes.set(n, h);
     this.onTurnApplied?.(n);
-    if (this.role === "host") this._recordHash(n, DEVICE_ID, h);
-    else this.match.broadcast({ t: "hash", n, from: DEVICE_ID, hash: h } satisfies Wire);
+    // Everyone broadcasts (the host too): desync detection is symmetric, so any
+    // client can flag the divergence and degrade to solo play.
+    this.match.broadcast({ t: "hash", n, from: DEVICE_ID, hash: h } satisfies Wire);
+    // Compare hashes that arrived from FASTER peers before we applied turn n --
+    // they were stored but unjudged (myHashes had no entry yet). Without this
+    // sweep the slow client (the one most likely diverged) never detects anything.
+    const early = this.peerHashes.get(n);
+    if (early) {
+      for (const [from, hash] of early) {
+        if (from !== DEVICE_ID && hash !== h) this._flagDesync(n, from);
+      }
+    }
   }
 
-  /** Host: compare a peer's per-turn hash against our canonical one. */
+  /** Every client: compare a peer's per-turn hash against our own for that turn.
+   *  If ours isn't computed yet, store it; _applyTurn sweeps the stored ones. */
   private _recordHash(n: number, from: string, hash: string): void {
     let m = this.peerHashes.get(n);
     if (!m) {
@@ -344,7 +393,13 @@ export class LockstepSession {
     m.set(from, hash);
     const canon = this.myHashes.get(n);
     if (canon !== undefined && from !== DEVICE_ID && hash !== canon) {
-      this.onDesync?.(n, from);
+      this._flagDesync(n, from);
+    }
+  }
+
+  private _flagDesync(n: number, from: string): void {
+    this.onDesync?.(n, from);
+    if (this.role === "host") {
       const snap = this.adapter.snapshot();
       if (snap !== null) this.match.broadcast({ t: "snap", n, snap } satisfies Wire);
     }

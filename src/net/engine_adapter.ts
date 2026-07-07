@@ -105,7 +105,11 @@ export function createEngineAdapter(): GameEngineAdapter {
         (gs.tanks[s.convert.tank] as unknown as TankShape).ai_class = s.convert.aiClass;
       }
       if (s.retreat) {
-        gs.retreat(); // turn-timeout self-forfeit / eviction: ordered like any turn
+        gs.retreat(); // disconnect eviction: forfeit the round, ordered like any turn
+        return;
+      }
+      if (s.skip) {
+        gs.skip_turn(); // turn timeout: lose this turn only, stay in the round
         return;
       }
       t.angle = s.angle;

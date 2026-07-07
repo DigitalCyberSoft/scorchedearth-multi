@@ -250,6 +250,13 @@ export class MultiplayerScreen extends Screen {
     // alive and zero shots fired). PLAY_MODE: the MP loop (fire wrapper, AIM
     // barrier, turn pump) is built for SEQUENTIAL only; SYNCHRONOUS/SIMULTANEOUS
     // route the engine into SYNC_AIM/SIM_LIVE, which MP does not drive.
+    // TALKING_TANKS: default the COMPUTER taunts ON for online matches.  The
+    // engine default is OFF (oracle-locked), and most hosts have OFF persisted,
+    // so an MP room would never see the taunt system at all; map OFF -> the
+    // computers-only tier and keep an explicit ALL (host chose it in SP config).
+    const talking = String(
+      (this.cfg as unknown as Record<string, unknown>).TALKING_TANKS ?? "OFF",
+    ).toUpperCase();
     const start: MatchStart = {
       seed,
       w: this.w,
@@ -258,6 +265,7 @@ export class MultiplayerScreen extends Screen {
         ...(this.cfg as unknown as Record<string, unknown>),
         TEAM_MODE: "NONE",
         PLAY_MODE: "SEQUENTIAL",
+        TALKING_TANKS: talking === "ALL" ? "ALL" : "COMPUTERS",
       },
       order,
     };

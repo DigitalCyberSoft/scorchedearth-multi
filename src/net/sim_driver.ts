@@ -29,6 +29,7 @@ export function sanitizeTurnInput(input: TurnInput): {
   angle: number;
   power: number;
   weapon: number;
+  skip: boolean;
   retreat: boolean;
   convert: { tank: number; aiClass: number } | null;
 } {
@@ -50,7 +51,8 @@ export function sanitizeTurnInput(input: TurnInput): {
     angle: clamp(input.angle, 0, 180),
     power: clamp(input.power, 0, 1000),
     weapon: clamp(input.weapon, 0, NUM_ITEMS - 1),
-    retreat: input.retreat === true, // strict boolean: any other shape means "fire"
+    skip: input.skip === true, // strict boolean: any other shape means "fire"
+    retreat: input.retreat === true,
     convert,
   };
 }
@@ -115,8 +117,8 @@ export class SimDriver {
     }
   }
 
-  /** Active human commits their turn: apply aim+fire (or the turn-timeout retreat),
-   *  then run to the next stop. */
+  /** Active human commits their turn: apply aim+fire (or the turn-timeout skip /
+   *  the disconnect retreat), then run to the next stop. */
   submitInput(input: TurnInput): StopReason {
     const t = this.gs.current_shooter;
     if (t) {
@@ -126,6 +128,8 @@ export class SimDriver {
       }
       if (s.retreat) {
         this.gs.retreat();
+      } else if (s.skip) {
+        this.gs.skip_turn(); // turn timeout: lose the turn only, stay in the round
       } else {
         t.angle = s.angle;
         t.power = s.power;

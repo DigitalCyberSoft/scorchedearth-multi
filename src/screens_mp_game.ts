@@ -83,9 +83,14 @@ export function shopBarrierReady(s: ShopBarrierState): "all_in" | "idle" | "ceil
   if (s.elapsedS >= s.ceilingS) return "ceiling";
   return null;
 }
-const DEFAULT_MAX_TURNS = 40; // host force-ends a round that runs this long (stalemate/AFK backstop)
-const DEFAULT_TURN_SECONDS = 30; // a turn self-forfeits after this long idle at the OWN client's barrier
-const TURN_WALL_FACTOR = 5; // host evicts a turn outliving this (x turnSeconds) wall-clock bound
+// Stalemate backstop ONLY: a round that somehow burns this many HUMAN turns is
+// force-ended (mass_kill -> shop). The old default of 40 was reachable in an
+// honest CPU-heavy round and kicked live matches into the shop mid-fight
+// (reported); 1000 is out of reach of real play while still bounding a dead
+// match. ?maxTurns still overrides for tests.
+const DEFAULT_MAX_TURNS = 1000;
+const DEFAULT_TURN_SECONDS = 30; // a turn is SKIPPED after this long idle at the OWN client's barrier
+const TURN_WALL_FACTOR = 5; // host skips a turn outliving this (x turnSeconds) wall-clock bound
 const DROP_GRACE_SECONDS = 6; // a peer gone this long (past reconnect) ends the match
 // Real-time sim pacing: the sim normally advances one FIXED_DT per rendered frame,
 // but Chrome throttles/pauses rAF for unfocused or occluded windows, so that client
@@ -138,7 +143,9 @@ export class MpGameScreen extends Screen {
   private turnForfeited = false;
   private lastRealMs: number | null = null; // real-time sim pacing (rAF-independent)
   private simDebt = 0; // real seconds the sim still owes (catch-up backlog)
-  private desyncNote = ""; // non-empty once the host flagged a divergence (shown in red)
+  private catchingUp = false; // a buffered future turn is being burst toward
+  private desyncNote = ""; // non-empty once a divergence was flagged (shown in red)
+  private solo = ""; // non-empty => detached after a desync; the match continues locally vs computers
   // ── CPU replacement of departed players (host decision) ──
   private cpuOffer: { deviceId: string; name: string; age: number } | null = null; // pending Y/N prompt
   private cpuReplace = new Set<string>(); // host said YES: convert at their next turn
@@ -163,20 +170,24 @@ export class MpGameScreen extends Screen {
     this.turnSeconds = Number(params.get("turnSeconds")) || DEFAULT_TURN_SECONDS;
     // No onControl handler: round-end and force-end are deterministic on every
     // client (no message), the shop barrier rides its own host-authoritative
-    // shopfin, and EVERY forfeit (turn-timeout self-forfeit AND the host's
-    // dead/stuck-client eviction) rides the numbered turn pipeline as a retreat
-    // turn, so it is ordered and applied at each client's own AIM barrier exactly
-    // like a shot. The old ctrl-"forfeit" was applied only if the receiver happened
-    // to be at AIM ON ARRIVAL -- a client still animating the previous flight
-    // silently DROPPED it and permanently desynced (host in the next round/shop,
-    // laggard stuck waiting).
-    // Surface detected desyncs in-game (they were previously logged only in the
-    // lobby lines, i.e. invisible during a match). Chain the lobby's handler --
-    // it keeps the __mpDesyncs test telemetry.
+    // shopfin, and every timeout/eviction rides the numbered turn pipeline (a SKIP
+    // turn for a timeout, a RETREAT turn for a disconnected player), so it is
+    // ordered and applied at each client's own AIM barrier exactly like a shot.
+    // The old ctrl-"forfeit" was applied only if the receiver happened to be at
+    // AIM ON ARRIVAL -- a client still animating the previous flight silently
+    // DROPPED it and permanently desynced (host in the next round/shop, laggard
+    // stuck waiting).
+    // A detected desync means the worlds have ALREADY diverged -- there is no
+    // shared match left to coordinate (auto-heal is a stub). Instead of letting
+    // the split worlds cascade (stalled barriers -> wall evictions -> the round
+    // collapsing into the shop), degrade gracefully: detach from the session and
+    // continue THIS world locally, with the other humans handed to the computer.
+    // Chain the lobby's handler -- it keeps the __mpDesyncs test telemetry.
     const prevDesync = this.session.onDesync;
     this.session.onDesync = (n, peer) => {
       prevDesync?.(n, peer);
       this.desyncNote = `SYNC LOST (turn ${n}): clients diverged`;
+      this._goSolo();
     };
     // Every client records carts (drives the "waiting for ..." display); the host's
     // copy is also the authoritative aggregation. A cart doubles as a sign of life.
@@ -274,7 +285,8 @@ export class MpGameScreen extends Screen {
     const realFire = gs.fire.bind(gs);
     const self = this;
     (gs as unknown as { fire: (s?: unknown) => unknown[] }).fire = function (shooter?: unknown): unknown[] {
-      if ((shooter === undefined || shooter === null) && gs.phase === AIM && self._isMyTurn()) {
+      // Solo (post-desync): no lockstep left -- the local fire is just a fire.
+      if ((shooter === undefined || shooter === null) && gs.phase === AIM && self._isMyTurn() && !self.solo) {
         const t = gs.current_shooter as { angle: number; power: number; selected_weapon: number } | null;
         if (t) {
           self.session.commitTurn({ angle: t.angle, power: t.power, weapon: t.selected_weapon, moves: [] });
@@ -287,6 +299,34 @@ export class MpGameScreen extends Screen {
 
   private _isMyTurn(): boolean {
     return this.adapter.activeDeviceId() === DEVICE_ID;
+  }
+
+  /** Degrade to LOCAL play after a desync: the worlds diverged, so the lockstep
+   *  match is unrecoverable (auto-heal is a stub) -- but THIS world is a perfectly
+   *  playable game. Detach from the session (chat stays live), hand every remote
+   *  human's tank to the computer, and keep playing this match to its end instead
+   *  of letting the split worlds cascade into stalls and a collapsed round. */
+  private _goSolo(): void {
+    if (this.solo) return;
+    this.solo = "sync lost -- continuing this match against the computer";
+    this.session.detach();
+    const gs = this.adapter.state();
+    if (!gs) return;
+    const ids = this.adapter.deviceIds();
+    for (let i = 0; i < ids.length && i < gs.tanks.length; i++) {
+      const t = gs.tanks[i] as unknown as { ai_class: number };
+      if (ids[i] !== DEVICE_ID && t.ai_class === 0) t.ai_class = 8; // human -> AI_UNKNOWN (re-rolls at its next turn)
+    }
+    // A remote human's AIM turn is orphaned by the conversion (the engine queued it
+    // as a human turn): skip it so play moves on; the engine drives the converted
+    // tank itself from its next turn.
+    if (gs.phase === AIM && !this._isMyTurn()) {
+      this.adapter.applyTurnInput({ angle: 0, power: 0, weapon: 0, moves: [], skip: true });
+    }
+    // Disconnect bookkeeping is meaningless now.
+    this.cpuOffer = null;
+    this.cpuReplace.clear();
+    this.turnForfeited = false;
   }
 
   override handle(event: ScreenEvent): ScreenAction {
@@ -380,6 +420,18 @@ export class MpGameScreen extends Screen {
     const realDt = this.lastRealMs === null ? dt : (nowMs - this.lastRealMs) / 1000;
     this.lastRealMs = nowMs;
     this.simDebt = Math.min(this.simDebt + Math.max(realDt, 0), MAX_SIM_DEBT_S);
+    // PIPELINE catch-up: a buffered FUTURE turn is proof this client is at least
+    // one full turn behind its sender -- real-time stepping alone never closes
+    // that gap (it replays the backlog at 1x forever, the reported "guest lags
+    // the host" defect). Burst at full catch-up speed until the buffer drains,
+    // then zero the debt: the freshest applied state IS "now".
+    if (!this.solo && this.session.hasBuffered()) {
+      this.simDebt = MAX_SIM_DEBT_S;
+      this.catchingUp = true;
+    } else if (this.catchingUp) {
+      this.catchingUp = false;
+      this.simDebt = 0;
+    }
     // 0 steps on a fast frame is correct (a 120 Hz display no longer runs 2x).
     const steps = Math.min(Math.floor(this.simDebt / FIXED_DT), MAX_CATCHUP_STEPS);
     for (let i = 0; i < steps; i++) {
@@ -392,7 +444,7 @@ export class MpGameScreen extends Screen {
       // eviction) reaches us; a real opponent turn can never match there (the
       // per-sender rule keys it to the active player, i.e. us, and we don't message
       // ourselves).
-      if (gs.phase === AIM) this.session.tryPump();
+      if (gs.phase === AIM && !this.solo) this.session.tryPump();
       // Stop bursting at interactive/coordinated points: our own aim turn runs in
       // real time, and ROUND_END/SHOP/GAME_OVER are driven per frame by _coordinate.
       const p = gs.phase as string;
@@ -421,8 +473,13 @@ export class MpGameScreen extends Screen {
       cpuOffer: this.cpuOffer ? this.cpuOffer.name : null,
       aiTanks: gs.tanks.filter((t) => (t as unknown as { ai_class: number }).ai_class !== 0).length,
       desync: this.desyncNote !== "",
+      solo: this.solo !== "",
+      catchingUp: this.catchingUp,
       aborted: this.aborted,
       alive: gs.tanks.filter((t) => t.alive).length,
+      turns: this.turnsThisRound,
+      maxTurns: this.maxTurns,
+      shooter: gs.current_shooter ? (gs.current_shooter as { name?: string }).name ?? null : null,
     };
     return null;
   }
@@ -455,11 +512,14 @@ export class MpGameScreen extends Screen {
     }
   }
 
-  /** Wall-clock-driven guards (host turn-timeout forfeit + disconnect detection).
-   *  These are real-time decisions, so the host drives the forfeit (broadcast) and
-   *  every client independently watches its own roster for a dropped player. */
+  /** Wall-clock-driven guards (turn timeout + disconnect detection). These are
+   *  real-time decisions; every client independently watches its own roster for a
+   *  dropped player. */
   private _realtimeGuards(gs: GameState, dt: number): void {
     if (this.aborted || gs.phase === GAME_OVER) return;
+    // Solo (post-desync): no peers to time out, no roster to watch, no aborts --
+    // the engine drives every non-local tank and my own turns have no waiters.
+    if (this.solo) return;
     const players = this.session.match.players();
     // A peer counts as present only if the ICE layer says connected AND a datachannel
     // frame arrived recently. The second clause is the dead-peer detection: it catches a
@@ -505,27 +565,30 @@ export class MpGameScreen extends Screen {
       this.droppedFor = 0;
     }
     // Every client advances the turn clock so the ACTIVE player sees their own
-    // countdown. Forfeits are RETREAT TURNS through the numbered pipeline:
-    //   - Turn timeout is SELF-enforced: the active player's own client commits the
-    //     retreat when ITS clock expires. Its clock starts when ITS sim reaches the
-    //     turn, so a slow/backgrounded client is never forfeited for being late --
-    //     only for being idle at its own barrier. (The old host-side wall clock
-    //     forfeited players who were still animating the previous flight; with 2
-    //     players that retreat ended the round and dumped the host in the shop.)
-    //   - The HOST evicts only a DEAD (transport-silent past PEER_DEAD_MS; merely
-    //     throttled windows keep heartbeating) or STUCK (turnWall: alive but never
-    //     advancing) active player, by committing the retreat on their behalf
-    //     (tryPump accepts a host stand-in for retreat turns only). If the victim
-    //     revives and fires in the same instant, the numbered pipeline rejects the
-    //     loser of the race and the hash check flags the divergence.
+    // countdown. Timeouts and evictions ride the numbered turn pipeline:
+    //   - Turn timeout = SKIP THE TURN, nothing more: the tank stays alive and in
+    //     the round, play passes to the next shooter. SELF-enforced: the active
+    //     player's own client commits the skip when ITS clock expires. Its clock
+    //     starts when ITS sim reaches the turn, so a slow/backgrounded client is
+    //     never skipped for being late -- only for being idle at its own barrier.
+    //   - The HOST stands in only for an active player who cannot self-enforce:
+    //     DEAD (transport-silent past PEER_DEAD_MS; merely throttled windows keep
+    //     heartbeating) commits a RETREAT -- the player left, forfeit the round
+    //     (and convert to a computer if the host approved replacement). STUCK
+    //     (turnWall: heartbeating but never advancing, e.g. a wedged tab that
+    //     cannot run its own clock) commits a SKIP -- still connected players
+    //     never lose more than the turn. tryPump accepts a host stand-in only
+    //     with skip/retreat set, never a fire. If the victim revives and fires in
+    //     the same instant, the hash check flags the divergence and both sides
+    //     degrade to solo play (_goSolo).
     if (gs.phase === AIM && !this.turnForfeited) {
       this.turnElapsed += dt;
       this.turnWall += dt;
-      const retreatTurn = { angle: 0, power: 0, weapon: 0, moves: [], retreat: true };
+      const skipTurn = { angle: 0, power: 0, weapon: 0, moves: [], skip: true };
       if (this._isMyTurn()) {
         if (this.turnElapsed > this.turnSeconds) {
           this.turnForfeited = true;
-          this.session.commitTurn(retreatTurn);
+          this.session.commitTurn(skipTurn);
         }
       } else if (this.isHost) {
         const activeId = this.adapter.activeDeviceId();
@@ -533,12 +596,13 @@ export class MpGameScreen extends Screen {
         // msSinceHeard would read Infinity and instantly evict an AI turn.
         const activeRemoteHuman = activeId !== null && this.adapter.humanDeviceIds().includes(activeId);
         const activeDead = activeRemoteHuman && this.session.match.msSinceHeard(activeId) > PEER_DEAD_MS;
-        if (activeDead || this.turnWall > this.turnSeconds * TURN_WALL_FACTOR) {
+        if (activeDead) {
           this.turnForfeited = true;
           // If the host approved CPU replacement for this departed player, convert
           // their tank as part of the eviction. This is the ONE race-free moment:
           // the victim is the active player and is dead, so no client can commit a
           // competing turn while the host stands in.
+          const retreatTurn = { angle: 0, power: 0, weapon: 0, moves: [], retreat: true };
           const idx = activeId !== null ? this.adapter.deviceIds().indexOf(activeId) : -1;
           if (activeId !== null && idx >= 0 && this.cpuReplace.has(activeId)) {
             this.cpuReplace.delete(activeId);
@@ -546,6 +610,10 @@ export class MpGameScreen extends Screen {
           } else {
             this.session.commitTurn(retreatTurn);
           }
+        } else if (this.turnWall > this.turnSeconds * TURN_WALL_FACTOR) {
+          // Stuck but still heartbeating: hasn't disconnected, so lose the turn only.
+          this.turnForfeited = true;
+          this.session.commitTurn(skipTurn);
         }
       }
     }
@@ -600,7 +668,8 @@ export class MpGameScreen extends Screen {
     if (this.shopfinApplied) return; // already advanced to the next round on this client
 
     // Guest: apply the host's authoritative outcome for THIS shop once it arrives.
-    if (!this.isHost && this.pendingShopFinal && this.pendingShopFinal.round === this.shopRound) {
+    // (Never in solo -- a shopfin from a diverged world must not touch this one.)
+    if (!this.solo && !this.isHost && this.pendingShopFinal && this.pendingShopFinal.round === this.shopRound) {
       this._applyShopFinal(this.pendingShopFinal.results);
       this.pendingShopFinal = null;
       return;
@@ -622,6 +691,16 @@ export class MpGameScreen extends Screen {
     // finalizes immediately and never blocks the barrier.
     if (!this.shopSubmitted && (this.shopIdle >= this.shopSeconds || !iAmHuman)) {
       this._submitLocalCart(iAmHuman);
+    }
+
+    // Solo (post-desync): I am the only human left in THIS world, so there is no
+    // barrier to wait on -- my ~Done (or the idle auto-finish) resolves the round.
+    if (this.solo) {
+      if (this.shopSubmitted) {
+        this.shopfinApplied = true;
+        this.adapter.finishShop(); // run_ai_buys + begin_next_round, locally
+      }
+      return;
     }
 
     // Host barrier (see shopBarrierReady for the exact rule).
@@ -705,7 +784,8 @@ export class MpGameScreen extends Screen {
       y += r.get_height() + 14;
     };
     if (this.cpuOffer) note(`${this.cpuOffer.name} disconnected -- Y: replace with computer  N: don't`, [255, 210, 120]);
-    if (this.desyncNote) note(this.desyncNote, [255, 120, 110]);
+    if (this.solo) note(this.solo, [255, 210, 120]);
+    else if (this.desyncNote) note(this.desyncNote, [255, 120, 110]);
   }
 
   private _drawChat(surf: pygame.Surface): void {
@@ -817,12 +897,18 @@ export class MpGameScreen extends Screen {
 
     const by = this.app.h - 44;
     const mine = this._isMyTurn();
-    const turnTxt = mine ? "YOUR TURN" : `waiting for ${(gs.current_shooter as { name?: string } | null)?.name ?? "..."}`;
+    // "catching up" is honest when a future turn is buffered: we are NOT waiting
+    // on the player, we are replaying our own backlog to reach their turn.
+    const turnTxt = mine
+      ? "YOUR TURN"
+      : this.catchingUp
+        ? "catching up..."
+        : `waiting for ${(gs.current_shooter as { name?: string } | null)?.name ?? "..."}`;
     surf.blit(f.render(turnTxt, true, mine ? [120, 255, 140] : [230, 230, 140]), [12, by]);
     if (this.banner) surf.blit(fs.render(this.banner, true, [180, 220, 255]), [12, by + 22]);
-    // Turn countdown shown to EVERY client (the active player most needs it; the host
-    // remains the authority that actually forfeits).
-    if (gs.phase === AIM) {
+    // Turn countdown shown to EVERY client (the active player most needs it: at
+    // zero their own client skips the turn). Solo has no timeout, so no countdown.
+    if (gs.phase === AIM && !this.solo) {
       const left = Math.max(0, Math.ceil(this.turnSeconds - this.turnElapsed));
       surf.blit(fs.render(`turn ${left}s`, true, left <= 5 ? [255, 160, 120] : [200, 200, 200]), [12, by - 20]);
     }
@@ -833,6 +919,7 @@ export class MpGameScreen extends Screen {
 
   /** bottom-right: live connection summary (the "connection info during the match"). */
   private _drawConnSummary(surf: pygame.Surface, fs: pygame.Font): void {
+    if (this.solo) return; // detached: peer counts are meaningless (the note explains)
     const players = this.session.match.players();
     const conn = players.filter((p) => p.connected || p.deviceId === DEVICE_ID).length;
     const cr = fs.render(`players ${conn}/${players.length}`, true, conn >= players.length ? [140, 230, 160] : [255, 180, 120]);

@@ -52,13 +52,16 @@ each turn clients exchange a world hash so divergence is caught.
    alone against computers.
 4. When everyone shows connected, the host presses **Start**. Players take turns:
    adjust angle (left/right) and power (up/down), then **Space** to fire. Idling at
-   your own turn past the countdown **forfeits the round, never the match** (your
-   tank retreats: no kill bonus for the enemy, you respawn next round with your
-   score and cash). A slow or backgrounded browser is never treated as idle - the
-   clock only runs once your own game reaches your turn, and an unfocused window
-   fast-forwards its simulation to catch up in real time.
-5. If a player disconnects mid-match, the host is asked whether to **replace them
-   with a computer**; the match then carries on (otherwise it ends once you are the
+   your own turn past the countdown just **skips that turn** - your tank stays
+   alive and in the round, and play passes to the next player. A slow or
+   backgrounded browser is never treated as idle - the clock only runs once your
+   own game reaches your turn, and an unfocused window fast-forwards its
+   simulation to catch up in real time. Computer tanks taunt before firing and
+   when destroyed, as in the original. A round that never resolves on its own is
+   force-ended after 1,000 turns - the same deterministic bound on every client.
+5. If a player disconnects mid-match, their tank retreats out of the current round
+   (no kill bonus for anyone) and the host is asked whether to **replace them with
+   a computer**; the match then carries on (otherwise it ends once you are the
    last one standing, as before).
 6. **Between rounds the weapon shop opens for everyone at once.** Each player shops
    their own tank; purchases are replicated to every client. The next round starts
@@ -94,8 +97,14 @@ converged (identical world hash, zero desyncs). Verified by:
   the idle allowance is never cut off** and the round advances within a second of the
   last cart; chat lines typed with real keys replicate to the other browser during
   gameplay and over the open shop; inventories and world hashes converge, zero desyncs.
-- A desync-detection test: a clean run reports zero desyncs, and a deliberately injected
-  divergence on one client is caught by the host.
+- A desync-detection + **solo-continuation** acceptance: a clean run reports zero
+  desyncs; a deliberately injected divergence is caught by BOTH clients (everyone
+  broadcasts and compares per-turn hashes, host included), after which each side
+  detaches and keeps playing its own world with the other humans handed to the
+  computer - chat still flows between the detached clients.
+- A **turn-skip acceptance**: with a 4-second turn timer, an idle turn is skipped
+  (both tanks stay alive on both clients), the skipped player gets their next turn
+  back, and a real shot afterwards still converges with zero desyncs.
 - A **throttled-client acceptance**: with the guest's CPU throttled 15x while the host
   fires, the round never ends early, the slow guest is never forfeited, and its world
   hash converges with the host's once it catches up.
@@ -107,7 +116,8 @@ converged (identical world hash, zero desyncs). Verified by:
 - A 3-browser **lobby acceptance**: three humans join one room, a chat line typed in
   the lobby replicates to both other browsers before the start, the conversation is
   still on screen once the match begins, and all three converge after the first turn.
-- Behavioral checks for the per-turn round forfeit and match-ends-on-disconnect.
+- Behavioral checks for the turn-timeout skip, the disconnect retreat, and
+  match-ends-on-disconnect.
 
 Code: `src/net/{nostr,peer,signaling,match,lockstep,engine_adapter,sim_driver,metrics}.ts`,
 the lobby `src/screens_mp.ts`, and the in-game screen `src/screens_mp_game.ts`.
@@ -120,11 +130,14 @@ one snapshot of every tank's inventory that every client applies before the next
 message ordering cannot desync inventories. The host advances the shop only when every
 cart is in, when every missing player has been shop-inactive past the allowance, or at the
 absolute ceiling; shop carts and keepalives are **round-tagged** so a message from one shop
-can never satisfy another shop's barrier. Forfeits ride the same numbered turn pipeline
-as shots (a "retreat turn"), so they are ordered and applied at every client's own aim
-barrier: the turn timeout is enforced by the active player's OWN client (a slow or
-backgrounded browser is late, not idle), and the host may stand in only with a
-retreat/convert turn for a transport-dead or stuck client - never a shot. Each client
+can never satisfy another shop's barrier. Timeouts and evictions ride the same numbered
+turn pipeline as shots, so they are ordered and applied at every client's own aim
+barrier: a turn timeout is a **skip turn** (lose the turn, stay in the round), enforced
+by the active player's OWN client (a slow or backgrounded browser is late, not idle);
+the host may stand in only for a client that cannot self-enforce - a skip for a stuck
+but still-connected one, a retreat/convert for a transport-dead one - never a shot.
+Behavioral tests pin that a skip kills nobody and a retreat still removes the tank
+(`test/mp_skip_solo.test.ts`). Each client
 also steps its simulation by real elapsed time (bounded), so an unfocused window whose
 rAF Chrome pauses fast-forwards to the barrier instead of crawling in slow motion. The
 host's copy of the match config is sanitized before broadcast (team mode off, sequential
@@ -150,10 +163,12 @@ This is a working vertical slice, not a shipped product:
   `src/net/netconfig.ts` and rebuild, or inject them at runtime with
   `?turn=<base64 of a JSON RTCIceServer>`. WebRTC connection testing so far was same-machine
   (loopback). (`?relays=ws://...` can still point at a private Nostr relay.)
-- A detected desync is **reported, not auto-healed** (`EngineAdapter.snapshot`/`restore`
-  is a stub: it would wire `savegame.serialize`/`apply` plus the MT19937 stream position).
-  In practice the lockstep + host-authoritative shop have shown zero desyncs across the
-  5-round and shop tests, but there is no recovery path if one ever occurs.
+- A detected desync is **not auto-healed** (`EngineAdapter.snapshot`/`restore` is a
+  stub: it would wire `savegame.serialize`/`apply` plus the MT19937 stream position).
+  Instead each client that detects one **degrades to solo play**: it detaches from
+  the session (chat stays live) and continues its own world with the remote humans
+  handed to the computer, rather than letting the split worlds cascade into stalls
+  and a collapsed round. Re-joining a synced match means starting a new one.
 - The shop is **not server-refereed**: each client asserts its own resulting cart, so a
   modified client could grant itself items. Inventory values are bounds-clamped (anti-crash)
   but not validated against the economy. This is inherent to trustless P2P without a referee
@@ -211,11 +226,12 @@ This is not a fresh interpretation - it is a *verified reimplementation*:
 
 The verification:
 
-- **15,064 differential tests** (`npm test`, vitest) assert the TypeScript reproduces
-  the Python port's output **exactly** (integers, pixels, bytes) or within a tight
-  epsilon (transcendental math only). The RNG reproduces CPython's Mersenne Twister
-  bit-for-bit; the game engine is checked by 25,814 turn/round state snapshots; the
-  sprites by ~8M pixel assertions.
+- **15,733 tests** (`npm test`, vitest): differential tests assert the TypeScript
+  reproduces the Python port's output **exactly** (integers, pixels, bytes) or within
+  a tight epsilon (transcendental math only), plus this fork's own multiplayer
+  determinism suites. The RNG reproduces CPython's Mersenne Twister bit-for-bit; the
+  game engine is checked by 29,814 turn/round state snapshots; the sprites by ~8M
+  pixel assertions.
 - A **visual regression gate** (`visual/`, `bash visual/run_gate.sh`) renders identical
   seeded game states through both the TypeScript Canvas renderer and the Python pygame
   renderer and pixel-diffs them. The game **world** - sky, terrain, tanks - comes out
@@ -244,7 +260,7 @@ ships above; players never run any of this. It is only for modifying the code.
 npm install
 npm run dev          # dev server at http://localhost:5173
 npm run build        # static bundle into dist/ (what GitHub Pages serves)
-npm test             # the 15,064 differential tests against the Python oracle
+npm test             # the 15,732 tests (differential vs the Python oracle + MP determinism)
 ```
 
 ## The original assets
