@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <title>Scorched Earth - device profiler</title>
+    <style>
+      body { margin: 0; padding: 16px; background: #101318; color: #d7dce3;
+             font: 14px/1.45 ui-monospace, Menlo, Consolas, monospace; }
+      h1 { font-size: 18px; margin: 0 0 4px; color: #e8b34b; }
+      h2 { font-size: 15px; margin: 18px 0 6px; color: #9fc1e8; }
+      p  { margin: 4px 0; max-width: 76ch; }
+      button { font: inherit; background: #26436b; color: #e6edf6; border: 1px solid #3c649a;
+               border-radius: 4px; padding: 6px 14px; cursor: pointer; margin: 4px 6px 4px 0; }
+      button:disabled { opacity: .45; cursor: default; }
+      input { font: inherit; background: #0a0d11; color: #d7dce3; border: 1px solid #2a3140;
+              border-radius: 4px; padding: 5px 8px; width: 9ch; text-transform: uppercase; }
+      pre, textarea { background: #0a0d11; border: 1px solid #2a3140; border-radius: 4px;
+                      padding: 10px; white-space: pre; overflow-x: auto; }
+      textarea { width: 100%; height: 300px; color: #cfe3cf; box-sizing: border-box; resize: vertical; }
+      #dbg-frame-wrap { border: 1px solid #2a3140; border-radius: 4px; background: #000;
+                        width: 100%; max-width: 1024px; aspect-ratio: 1024 / 768; display: none; }
+      #dbg-frame { width: 100%; height: 100%; border: 0; }
+      .live { color: #7fd18a; min-height: 1.3em; }
+      .dim  { color: #7a828e; }
+      code  { color: #e8b34b; }
+    </style>
+  </head>
+  <body>
+    <h1>Scorched Earth - device profiler</h1>
+    <p>Measures how THIS machine runs the game: canvas speed benches, then the
+    real game with frame timing and per-canvas-call attribution. Nothing leaves
+    this machine unless you press Beam.</p>
+
+    <h2>1. Device</h2>
+    <pre id="dbg-device">collecting...</pre>
+
+    <h2>2. Canvas benches</h2>
+    <p class="dim">Full-frame ops on 1024x768 canvases: software-raster (the
+    game's willReadFrequently surfaces) vs default, the backbuffer present
+    blit, text rasterization, per-pixel stamping, and a GPU readback stall.
+    Lower ms/op is better.</p>
+    <button id="dbg-bench-btn">Run benches</button>
+    <pre id="dbg-bench">not run</pre>
+
+    <h2>3. Live game sample</h2>
+    <p class="dim">Load the game, navigate to the screen that lags (menu, tank
+    setup, in play), then sample. Sampling patches the game's canvas calls
+    with counters for 10 s and records frame times; note WHICH screen was up
+    when you report.</p>
+    <button id="dbg-load-btn">Load game</button>
+    <button id="dbg-sample-btn" disabled>Sample 10 s</button>
+    <span id="dbg-live" class="live"></span>
+    <div id="dbg-frame-wrap"><iframe id="dbg-frame" title="game"></iframe></div>
+
+    <h2>4. Report</h2>
+    <button id="dbg-copy-btn" disabled>Copy report</button>
+    <textarea id="dbg-report" readonly spellcheck="false">run the steps above; the report assembles here.</textarea>
+
+    <h2>5. Beam over the game relays</h2>
+    <p class="dim">Publishes the report to the game's public Nostr relays
+    (encrypted with the app channel key, like lobby traffic) so it can be read
+    from another machine with the code. On the other machine, open this page
+    and Receive with the same code.</p>
+    <p>code: <code id="dbg-code">-----</code>
+      <button id="dbg-beam-btn" disabled>Beam report</button>
+      <input id="dbg-recv-code" maxlength="5" placeholder="code" />
+      <button id="dbg-recv-btn">Receive</button>
+    </p>
+    <span id="dbg-net" class="live"></span>
+
+    <script type="module" src="/src/debug_page.ts"></script>
+  </body>
+</html>

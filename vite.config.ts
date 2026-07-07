@@ -5,6 +5,16 @@ import { defineConfig } from "vitest/config";
 // vectors in oracle/vectors/*.json.
 export default defineConfig({
   base: "./",
+  build: {
+    rollupOptions: {
+      // Two pages: the game (index.html) and the device profiler (debug.html,
+      // a standalone diagnostics page that reuses src/net for report beaming).
+      input: {
+        main: "index.html",
+        debug: "debug.html",
+      },
+    },
+  },
   test: {
     globals: true,
     environment: "node",
