@@ -114,7 +114,19 @@ This is a working vertical slice, not a shipped product:
 
 ## Screenshots
 
-Captured from this TypeScript / Canvas port running in the browser:
+Captured from this TypeScript / Canvas port running in the browser.
+
+### Online multiplayer (this fork)
+
+Two browsers connected over the default public Nostr relays (lobby) and the in-match
+overlay, shop, and standings. Both clients run the same deterministic engine in lockstep.
+
+|   |   |   |
+|:---:|:---:|:---:|
+| <img src="screenshots/mp-lobby.png" width="270"><br>Create a match (invite code) | <img src="screenshots/mp-lobby-ready.png" width="270"><br>Lobby: both players connected | <img src="screenshots/mp-turn.png" width="270"><br>Your turn |
+| <img src="screenshots/mp-waiting.png" width="270"><br>The other player's turn | <img src="screenshots/mp-shop.png" width="270"><br>The 60-second weapon shop | <img src="screenshots/mp-standings.png" width="270"><br>Between-round standings |
+
+### Single-player
 
 |   |   |   |
 |:---:|:---:|:---:|
