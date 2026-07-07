@@ -15,6 +15,7 @@ import {
   PRESENCE_INTERVAL_MS,
   ANNOUNCE_INTERVAL_MS,
   ANNOUNCE_TTL_MS,
+  HEARTBEAT_INTERVAL_MS,
   PROTOCOL_VERSION,
 } from "./netconfig";
 import { DEVICE_ID, uid } from "./identity";
@@ -81,6 +82,7 @@ export class Match {
   private _presenceTimer: ReturnType<typeof setInterval> | null = null;
   private _announceTimer: ReturnType<typeof setInterval> | null = null;
   private _pruneTimer: ReturnType<typeof setInterval> | null = null;
+  private _heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private _unsubSignaling: (() => void) | null = null;
   private _status: MatchInfo["status"] = "open";
 
@@ -215,6 +217,9 @@ export class Match {
       PRESENCE_INTERVAL_MS,
     );
     this._pruneTimer = setInterval(() => this._prune(), PRESENCE_INTERVAL_MS);
+    // Datachannel liveness ping: keeps msSinceHeard() fresh for live peers so the game
+    // can distinguish a wedged peer (silent) from one merely thinking on its turn.
+    this._heartbeatTimer = setInterval(() => this.peers.pingAll(), HEARTBEAT_INTERVAL_MS);
     this._emitRoster();
   }
 
@@ -289,10 +294,17 @@ export class Match {
     return this.peers.send(peerId, payload);
   }
 
+  /** ms since the last datachannel frame from a peer (Infinity if not open). The
+   *  app-level liveness signal the game reads to catch a wedged-but-"connected" peer. */
+  msSinceHeard(peerId: string): number {
+    return this.peers.msSinceHeard(peerId);
+  }
+
   leave(): void {
     if (this._presenceTimer) clearInterval(this._presenceTimer);
     if (this._announceTimer) clearInterval(this._announceTimer);
     if (this._pruneTimer) clearInterval(this._pruneTimer);
+    if (this._heartbeatTimer) clearInterval(this._heartbeatTimer);
     this._unsubSignaling?.();
     this.peers.closeAll();
     if (this.isPublic) {

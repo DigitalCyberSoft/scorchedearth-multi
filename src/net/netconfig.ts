@@ -90,9 +90,15 @@ export const DC_LABEL = "scorch";
 export const DC_CONFIG: RTCDataChannelInit = { ordered: true };
 
 // Cadences (ms).
-export const PRESENCE_INTERVAL_MS = 5_000; // room heartbeat (who is here)
+export const PRESENCE_INTERVAL_MS = 5_000; // Nostr room heartbeat (who is here)
 export const ANNOUNCE_INTERVAL_MS = 15_000; // public-match announcement refresh
 export const ANNOUNCE_TTL_MS = 60_000; // a public match silent longer than this is stale
+// Datachannel liveness (P2P, distinct from the Nostr room heartbeat above). Peers
+// ping each open channel every HEARTBEAT_INTERVAL_MS; a channel that delivers no
+// frame (ping OR game traffic) for PEER_DEAD_MS is treated as dead even while the
+// ICE layer still reports it "connected" -- the wedged-peer case ICE alone misses.
+export const HEARTBEAT_INTERVAL_MS = 2_000;
+export const PEER_DEAD_MS = 6_000; // 3 missed pings
 
 /** FIXED shared key for the PUBLIC lobby channel + the global start metric. Anyone
  *  running the app derives the same Nostr identity from it -> a single public room

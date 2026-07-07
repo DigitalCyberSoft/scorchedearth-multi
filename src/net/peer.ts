@@ -21,7 +21,12 @@ interface Conn {
   backoff: number;
   reconnectTimer: ReturnType<typeof setTimeout> | null;
   remoteDescSet: boolean;
+  lastHeard: number; // Date.now() of the last inbound datachannel frame (liveness)
 }
+
+// Reserved datachannel control frame: a liveness ping. Carries no `t`, so even if it
+// reached the game layer lockstep would ignore it; it is intercepted here regardless.
+const HEARTBEAT_FRAME = { __hb: 1 } as const;
 
 export type ConnState = RTCPeerConnectionState;
 
@@ -38,7 +43,7 @@ export class PeerManager {
       this._cleanup(peerId, false);
     }
     const pc = new RTCPeerConnection(rtcConfig());
-    const conn: Conn = { pc, dc: null, encKey, relays, iceQueue: [], backoff: 2000, reconnectTimer: null, remoteDescSet: false };
+    const conn: Conn = { pc, dc: null, encKey, relays, iceQueue: [], backoff: 2000, reconnectTimer: null, remoteDescSet: false, lastHeard: Date.now() };
     this._conns.set(peerId, conn);
 
     pc.onicecandidate = (e) => {
@@ -59,14 +64,20 @@ export class PeerManager {
     if (!conn) return;
     conn.dc = dc;
     dc.onopen = () => {
+      conn.lastHeard = Date.now(); // fresh baseline so a just-opened peer is not "dead" pre-first-ping
       // The pc reaches "connected" BEFORE the data channel opens, so the
       // pc-state-change alone reports isConnected()=false (dc not yet open). Re-fire
       // the change on dc open so listeners (roster) see the now-complete connection.
       this.onConnectionChange?.(peerId, conn.pc.connectionState);
     };
     dc.onmessage = (e) => {
+      conn.lastHeard = Date.now(); // ANY inbound frame (ping or game traffic) proves liveness
       try {
-        this.onMessage?.(peerId, JSON.parse(e.data as string));
+        const msg = JSON.parse(e.data as string);
+        // Heartbeat pings are a transport-only liveness signal; never surface them to
+        // the game layer.
+        if (msg && (msg as { __hb?: unknown }).__hb !== undefined) return;
+        this.onMessage?.(peerId, msg);
       } catch {
         /* non-JSON frame: ignore */
       }
@@ -164,6 +175,31 @@ export class PeerManager {
     const out: string[] = [];
     for (const [id, conn] of this._conns) if (conn.dc?.readyState === "open") out.push(id);
     return out;
+  }
+
+  /** Send a liveness ping over every open channel. A peer that stops emitting these
+   *  (see msSinceHeard) is wedged even while its RTCPeerConnection still reads
+   *  "connected" -- the case app-level dead-peer detection exists to catch. */
+  pingAll(): void {
+    const blob = JSON.stringify(HEARTBEAT_FRAME);
+    for (const conn of this._conns.values()) {
+      if (conn.dc?.readyState === "open") {
+        try {
+          conn.dc.send(blob);
+        } catch {
+          /* drop */
+        }
+      }
+    }
+  }
+
+  /** Milliseconds since the last inbound datachannel frame from `peerId`, or Infinity
+   *  if there is no open channel. Stays small while the peer pings / sends turns; it
+   *  grows once the peer wedges, which the game reads to declare the peer dead. */
+  msSinceHeard(peerId: string): number {
+    const conn = this._conns.get(peerId);
+    if (!conn || conn.dc?.readyState !== "open") return Infinity;
+    return Date.now() - conn.lastHeard;
   }
 
   private _scheduleReconnect(peerId: string): void {

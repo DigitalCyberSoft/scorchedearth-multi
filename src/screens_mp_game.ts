@@ -28,7 +28,7 @@ import type { ScreenAction, ScreenEvent } from "./screen";
 import { GameState, AIM, ROUND_END, SHOP, GAME_OVER } from "./game";
 import { FIXED_DT } from "./net/sim_driver";
 import { DEVICE_ID } from "./net/identity";
-import { testHooks } from "./net/netconfig";
+import { testHooks, PEER_DEAD_MS } from "./net/netconfig";
 import type { LockstepSession, ShopResult } from "./net/lockstep";
 import type { Role } from "./net/match";
 import type { GameEngineAdapter } from "./net/engine_adapter";
@@ -317,7 +317,13 @@ export class MpGameScreen extends Screen {
   private _realtimeGuards(gs: GameState, dt: number): void {
     if (this.aborted || gs.phase === GAME_OVER) return;
     const players = this.session.match.players();
-    const connected = players.filter((p) => p.connected || p.deviceId === DEVICE_ID).length;
+    // A peer counts as present only if the ICE layer says connected AND a datachannel
+    // frame arrived recently. The second clause is the dead-peer detection: it catches a
+    // peer whose RTCPeerConnection still reads "connected" but has gone silent (wedged
+    // tab, frozen JS, black-holed path) before ICE consent-freshness notices.
+    const connected = players.filter(
+      (p) => p.deviceId === DEVICE_ID || (p.connected && this.session.match.msSinceHeard(p.deviceId) <= PEER_DEAD_MS),
+    ).length;
     if (this.startCount === 0 && connected >= 2) this.startCount = connected;
     // End the match only when you are the last one connected; a 3+ player match keeps
     // going (1v1) after a single drop instead of ending for everyone.
@@ -331,10 +337,22 @@ export class MpGameScreen extends Screen {
     // countdown; only the host acts on it (authoritative forfeit broadcast).
     if (gs.phase === AIM && !this.turnForfeited) {
       this.turnElapsed += dt;
-      if (this.isHost && this.turnElapsed > this.turnSeconds) {
+      // The host also forfeits the active player's turn the instant that player is
+      // detected dead (a REMOTE HUMAN silent past PEER_DEAD_MS), so a wedged shooter does
+      // not stall the lockstep AIM barrier for the whole turn window. The humanDeviceIds
+      // guard keeps this from ever firing on an AI turn (an AI slot has a deviceId but no
+      // peer, so msSinceHeard would read Infinity). Both triggers use the same
+      // host-authoritative forfeit broadcast, so every client stays deterministic.
+      const activeId = this.adapter.activeDeviceId();
+      const activeDead =
+        activeId !== null &&
+        activeId !== DEVICE_ID &&
+        this.adapter.humanDeviceIds().includes(activeId) &&
+        this.session.match.msSinceHeard(activeId) > PEER_DEAD_MS;
+      if (this.isHost && (this.turnElapsed > this.turnSeconds || activeDead)) {
         this.turnForfeited = true;
         this.session.sendControl("forfeit");
-        gs.retreat(); // forfeit the AFK player's round; advances the turn (synced at AIM)
+        gs.retreat(); // forfeit the AFK/dead player's round; advances the turn (synced at AIM)
       }
     }
   }
