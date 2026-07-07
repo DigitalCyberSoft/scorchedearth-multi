@@ -1055,6 +1055,8 @@ export const K_7 = 55;
 export const K_8 = 56;
 export const K_9 = 57;
 
+export const K_BACKQUOTE = 96; // ` -- SDLK_BACKQUOTE (the MP chat toggle)
+
 // Letters K_a..K_z = 97..122 (SDL keycodes are the lowercase ASCII values).
 export const K_a = 97;
 export const K_b = 98;
@@ -1121,6 +1123,7 @@ const CODE_TO_SDL: { readonly [code: string]: number } = {
   NumpadEnter: K_KP_ENTER,
   Escape: K_ESCAPE,
   Space: K_SPACE,
+  Backquote: K_BACKQUOTE,
   Minus: K_MINUS,
   BracketLeft: K_LEFTBRACKET,
   BracketRight: K_RIGHTBRACKET,
@@ -1150,6 +1153,7 @@ export function keyToPygame(e: KeyboardEvent): number {
     if (cc >= 97 && cc <= 122) return cc; // a..z
     if (cc >= 48 && cc <= 57) return cc; // 0..9
     if (ch === " ") return K_SPACE;
+    if (ch === "`") return K_BACKQUOTE; // layouts where ` is not the Backquote key
     if (ch === "-") return K_MINUS;
     if (ch === "[") return K_LEFTBRACKET;
     if (ch === "]") return K_RIGHTBRACKET;

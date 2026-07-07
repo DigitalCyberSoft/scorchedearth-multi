@@ -65,14 +65,36 @@ type Wire =
   | { t: "hash"; n: number; from: string; hash: string }
   | { t: "snap"; n: number; snap: unknown }
   | { t: "ctrl"; kind: string; data?: unknown }
-  | { t: "shop"; from: string; inv: number[]; cash: number }
-  | { t: "shopfin"; results: Record<string, ShopResult> };
+  // Shop messages are tagged with the shop's round index so a cart/keepalive from
+  // one shop can never satisfy (or stall) the barrier of a different shop -- clients
+  // reach each shop at different wall-clock times, so untagged messages can cross.
+  | { t: "shop"; from: string; round: number; inv: number[]; cash: number }
+  | { t: "shopact"; from: string; round: number } // "still shopping" keepalive
+  | { t: "shopfin"; round: number; results: Record<string, ShopResult> }
+  | { t: "chat"; from: string; text: string };
 
 // Anti-abuse bounds on buffered remote input. A peer controls every byte it sends,
 // so the buffer must not grow without limit and must not let one peer act for another.
 const TURN_WINDOW = 8; // accept turns at most this many ahead of the applied one
 const MAX_PENDING_TURNS = 32; // hard cap on buffered turn slots (OOM backstop)
 const MAX_MOVES = 256; // cap pre-fire drive steps carried per turn (engine ignores them today)
+const CHAT_MAX_LEN = 120; // chat line length cap (after control-char strip)
+const CHAT_MIN_INTERVAL_MS = 400; // per-peer chat rate limit (drop faster than this)
+const SHOPACT_MIN_INTERVAL_MS = 500; // per-peer shop-keepalive rate limit
+
+/** Sanitize an untrusted chat string: must be a string; control characters are
+ *  stripped (they would confuse the canvas text renderer), whitespace is trimmed,
+ *  and the result is length-capped. Returns "" when nothing displayable remains. */
+export function sanitizeChat(raw: unknown): string {
+  if (typeof raw !== "string") return "";
+  let out = "";
+  for (const ch of raw.slice(0, CHAT_MAX_LEN * 4)) {
+    const c = ch.codePointAt(0) ?? 0;
+    if (c >= 0x20 && c !== 0x7f) out += ch;
+    if (out.length >= CHAT_MAX_LEN) break;
+  }
+  return out.trim();
+}
 
 export class LockstepSession {
   private turnNo = 0;
@@ -89,10 +111,17 @@ export class LockstepSession {
    *  the in-game screen for host-driven coordination that is not a deterministic
    *  turn input. */
   onControl: ((kind: string, data: unknown) => void) | null = null;
-  /** A peer finalized its own shop purchases (the host aggregates these). */
-  onShopResult: ((deviceId: string, inv: number[], cash: number) => void) | null = null;
+  /** A peer finalized its own shop purchases for shop `round` (the host aggregates
+   *  these; every client records them for the "waiting for ..." display). */
+  onShopResult: ((deviceId: string, round: number, inv: number[], cash: number) => void) | null = null;
+  /** A peer reported live shop activity for shop `round` (host idle tracking). */
+  onShopActivity: ((deviceId: string, round: number) => void) | null = null;
   /** Host-authoritative post-shop state for every human tank (guests apply it). */
-  onShopFinal: ((results: Record<string, ShopResult>) => void) | null = null;
+  onShopFinal: ((round: number, results: Record<string, ShopResult>) => void) | null = null;
+  /** A peer sent a chat line (already sanitized + rate-limited). */
+  onChat: ((deviceId: string, text: string) => void) | null = null;
+  private _lastChatMs = new Map<string, number>(); // per-peer chat rate limiting
+  private _lastActMs = new Map<string, number>(); // per-peer shopact rate limiting
 
   constructor(
     readonly match: Match,
@@ -132,13 +161,24 @@ export class LockstepSession {
   }
 
   /** A player broadcasts its own finalized shop cart (self-only; the host aggregates). */
-  sendShop(inv: number[], cash: number): void {
-    this.match.broadcast({ t: "shop", from: DEVICE_ID, inv, cash } satisfies Wire);
+  sendShop(round: number, inv: number[], cash: number): void {
+    this.match.broadcast({ t: "shop", from: DEVICE_ID, round, inv, cash } satisfies Wire);
+  }
+
+  /** A player broadcasts "I am actively shopping" (screen throttles the cadence). */
+  sendShopActivity(round: number): void {
+    this.match.broadcast({ t: "shopact", from: DEVICE_ID, round } satisfies Wire);
   }
 
   /** Host broadcasts the authoritative post-shop state for every human tank. */
-  sendShopFinal(results: Record<string, ShopResult>): void {
-    this.match.broadcast({ t: "shopfin", results } satisfies Wire);
+  sendShopFinal(round: number, results: Record<string, ShopResult>): void {
+    this.match.broadcast({ t: "shopfin", round, results } satisfies Wire);
+  }
+
+  /** Broadcast a chat line (overlay-only; never touches the simulation). */
+  sendChat(text: string): void {
+    const clean = sanitizeChat(text);
+    if (clean) this.match.broadcast({ t: "chat", from: DEVICE_ID, text: clean } satisfies Wire);
   }
 
   /** Apply the next buffered remote turn IFF the local engine has reached its AIM
@@ -190,15 +230,50 @@ export class LockstepSession {
         break;
       case "shop":
         // A player's own finalized cart: self-only (a peer can submit only its own
-        // tank). Values are clamped on apply (engine_adapter), so just a light check.
-        if (typeof msg.from === "string" && msg.from === peerId && Array.isArray(msg.inv)) {
-          this.onShopResult?.(msg.from, msg.inv.slice(0, 64), Number(msg.cash) || 0);
+        // tank) and tagged with the shop round it belongs to. Values are clamped on
+        // apply (engine_adapter), so just a light check.
+        if (
+          typeof msg.from === "string" &&
+          msg.from === peerId &&
+          Number.isInteger(msg.round) &&
+          msg.round >= 0 &&
+          Array.isArray(msg.inv)
+        ) {
+          this.onShopResult?.(msg.from, msg.round, msg.inv.slice(0, 64), Number(msg.cash) || 0);
+        }
+        break;
+      case "shopact":
+        // "Still shopping" keepalive: self-only + round-tagged + rate-limited.
+        if (typeof msg.from === "string" && msg.from === peerId && Number.isInteger(msg.round) && msg.round >= 0) {
+          const now = Date.now();
+          if (now - (this._lastActMs.get(peerId) ?? 0) >= SHOPACT_MIN_INTERVAL_MS) {
+            this._lastActMs.set(peerId, now);
+            this.onShopActivity?.(msg.from, msg.round);
+          }
         }
         break;
       case "shopfin":
         // Host-authoritative post-shop outcome for all human tanks.
-        if (peerId === this.match.hostId && msg.results && typeof msg.results === "object") {
-          this.onShopFinal?.(msg.results);
+        if (
+          peerId === this.match.hostId &&
+          Number.isInteger(msg.round) &&
+          msg.round >= 0 &&
+          msg.results &&
+          typeof msg.results === "object"
+        ) {
+          this.onShopFinal?.(msg.round, msg.results);
+        }
+        break;
+      case "chat":
+        // Overlay-only text: self-only, sanitized, per-peer rate-limited. Never
+        // reaches the engine, so it cannot desync the simulation.
+        if (typeof msg.from === "string" && msg.from === peerId) {
+          const clean = sanitizeChat(msg.text);
+          const now = Date.now();
+          if (clean && now - (this._lastChatMs.get(peerId) ?? 0) >= CHAT_MIN_INTERVAL_MS) {
+            this._lastChatMs.set(peerId, now);
+            this.onChat?.(msg.from, clean);
+          }
         }
         break;
     }

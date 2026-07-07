@@ -11,11 +11,20 @@
 //   - host-coordinates the round-end -> shop -> next-round transitions and runs the
 //     shop window, so the match advances even if a player is idle.
 //
-// The between-round weapon shop is a flat timed window (default 60s): each player
-// shops their OWN tank locally, and at the barrier (all done, or the window elapses)
-// the host broadcasts one authoritative snapshot of every human tank's inventory so
-// every client converges before begin_next_round (see _coordinateShop). Idle past the
-// window => you get nothing.
+// The between-round weapon shop is concurrent: every player shops their OWN tank
+// locally, and the round advances ONLY when the host sees every human's cart
+// (host-controlled all-done barrier). "Too long" is measured as INACTIVITY, not as
+// a flat wall-clock window: per-client rAF clocks freeze whenever a browser window
+// is occluded/backgrounded (Chrome pauses rAF; dt is clamped at main.ts step()), so
+// with one human playing several browsers the old flat window expired on the host
+// while the player was actively shopping in another window. Now a player only times
+// out after shopSeconds with NO shop input (local auto-submit of the cart so far),
+// the host independently fires the same idle rule from its own clock as a backstop
+// for silent clients, and an absolute per-shop ceiling bounds adversarial stalling.
+// All shop messages are round-tagged so carts/keepalives from one shop can never
+// satisfy another shop's barrier (clients reach each shop at different real times).
+// A transparent chat overlay (backquote) rides its own wire message and never
+// touches the simulation, so players can talk while they wait -- or mid-round.
 // ───────────────────────────────────────────────────────────────────────────
 import * as pygame from "./pygame";
 import * as W from "./widgets";
@@ -29,7 +38,7 @@ import { GameState, AIM, ROUND_END, SHOP, GAME_OVER } from "./game";
 import { FIXED_DT } from "./net/sim_driver";
 import { DEVICE_ID } from "./net/identity";
 import { testHooks, PEER_DEAD_MS } from "./net/netconfig";
-import type { LockstepSession, ShopResult } from "./net/lockstep";
+import { sanitizeChat, type LockstepSession, type ShopResult } from "./net/lockstep";
 import type { Role } from "./net/match";
 import type { GameEngineAdapter } from "./net/engine_adapter";
 
@@ -42,8 +51,41 @@ export interface MpApp {
   h: number;
 }
 
-const DEFAULT_SHOP_SECONDS = 60; // flat between-round shop window (60s or you get nothing)
-const SHOP_GRACE_SECONDS = 2; // host waits this long past the window for late carts in flight
+const DEFAULT_SHOP_IDLE_SECONDS = 60; // shop auto-finishes after this much INACTIVITY (?shopSeconds)
+const SHOP_GRACE_SECONDS = 2; // host allows this much extra for keepalives/carts in flight
+const DEFAULT_SHOP_CEILING_SECONDS = 300; // absolute per-shop bound (?shopCeiling; anti-stall backstop)
+const SHOP_ACT_INTERVAL_SECONDS = 2; // broadcast "still shopping" at most this often
+const CHAT_KEEP = 50; // chat lines retained
+const CHAT_SHOW = 6; // chat lines visible in the overlay
+const CHAT_TTL_S = 20; // a line fades from the overlay after this long
+const CHAT_INPUT_MAX = 100; // compose-box length cap (wire caps again at 120)
+
+/** Inputs to the host's shop barrier decision (all values on the HOST's clock). */
+export interface ShopBarrierState {
+  humans: readonly string[]; // human device ids in this match
+  submitted: ReadonlySet<string>; // humans whose cart for THIS shop has arrived
+  idleMsOf: (deviceId: string) => number; // ms since last shop sign-of-life
+  idleLimitMs: number; // inactivity allowance (idle seconds + grace)
+  elapsedS: number; // host wall-clock seconds in this shop
+  ceilingS: number; // absolute per-shop bound
+}
+
+/** The host-controlled shop barrier. Fires ("advance the round") when:
+ *    "all_in"  -- every human's cart is in (the normal case), or
+ *    "idle"    -- every human still missing has been shop-inactive past the
+ *                 allowance; being active in ANY seat keeps that seat waiting, so a
+ *                 single person playing several browsers is never cut off, or
+ *    "ceiling" -- the absolute per-shop bound elapsed (a client that streams
+ *                 keepalives forever must not stall the match indefinitely).
+ *  Returns null while the shop must keep waiting. Pure: unit-tested directly. */
+export function shopBarrierReady(s: ShopBarrierState): "all_in" | "idle" | "ceiling" | null {
+  if (s.humans.length === 0) return null; // nothing to wait for -> nothing to decide
+  const pending = s.humans.filter((d) => !s.submitted.has(d));
+  if (pending.length === 0) return "all_in";
+  if (pending.every((d) => s.idleMsOf(d) > s.idleLimitMs)) return "idle";
+  if (s.elapsedS >= s.ceilingS) return "ceiling";
+  return null;
+}
 const DEFAULT_MAX_TURNS = 40; // host force-ends a round that runs this long (stalemate/AFK backstop)
 const DEFAULT_TURN_SECONDS = 30; // host forfeits the active player's turn after this long
 const DROP_GRACE_SECONDS = 6; // a peer gone this long (past reconnect) ends the match
@@ -59,18 +101,30 @@ export class MpGameScreen extends Screen {
   private wrapped = false;
   private proceeded = false; // proceed_after_round done this round (deterministic, all clients)
   private forceEnded = false; // round force-ended this round (deterministic, all clients)
-  // ── between-round shop (flat timed window; see _coordinateShop) ──
+  // ── between-round shop (concurrent; host-controlled all-done barrier) ──
   private shopRound = -1; // round_index the current shop was initialized for
-  private shopElapsed = 0; // real-time spent in the shop window
+  private shopElapsed = 0; // local wall-clock in this shop (ceiling backstop only)
+  private shopIdle = 0; // seconds since the LOCAL player last touched their open shop
+  private shopActAge = 0; // seconds since the last "still shopping" broadcast
   private shopStack: Screen[] = []; // local shop UI (ShopScreen + Sell/Inventory sub-screens)
-  private shopDone = false; // local player finished shopping (clicked Done or timed out)
+  private shopDone = false; // local player finished shopping (clicked Done or idled out)
   private shopSubmitted = false; // local cart broadcast/recorded this shop
   private shopfinApplied = false; // authoritative outcome applied -> advanced to next round
-  private shopResults = new Map<string, ShopResult>(); // host: deviceId -> submitted cart
-  private preShop = new Map<string, ShopResult>(); // host: deviceId -> pre-shop state ("nothing")
-  private pendingShopFinal: Record<string, ShopResult> | null = null; // guest: outcome to apply
+  // Latest cart per device, tagged with the shop round it belongs to. NOT cleared
+  // between shops: a cart for shop N can arrive while this client is still
+  // animating round N's end, i.e. before its own shop N initializes.
+  private shopCarts = new Map<string, ShopResult & { round: number }>();
+  private preShop = new Map<string, ShopResult>(); // host: deviceId -> pre-shop state
+  private hostLastActMs = new Map<string, number>(); // host: deviceId -> last sign of shopping life
+  private pendingShopFinal: { round: number; results: Record<string, ShopResult> } | null = null;
+  // ── chat overlay (transparent; gameplay + shop; never touches the sim) ──
+  private chatLines: { name: string; text: string; at: number }[] = [];
+  private chatOpen = false;
+  private chatText = "";
+  private nowS = 0; // monotonic screen clock (chat fading)
   private banner = "";
   private readonly shopSeconds: number;
+  private readonly shopCeiling: number;
   private readonly maxTurns: number;
   private readonly turnSeconds: number;
   private turnsThisRound = 0;
@@ -91,7 +145,8 @@ export class MpGameScreen extends Screen {
     this.role = role;
     this.isHost = role === "host";
     const params = new URLSearchParams(typeof location !== "undefined" ? location.search : "");
-    this.shopSeconds = Number(params.get("shopSeconds")) || DEFAULT_SHOP_SECONDS;
+    this.shopSeconds = Number(params.get("shopSeconds")) || DEFAULT_SHOP_IDLE_SECONDS;
+    this.shopCeiling = Number(params.get("shopCeiling")) || DEFAULT_SHOP_CEILING_SECONDS;
     this.maxTurns = Number(params.get("maxTurns")) || DEFAULT_MAX_TURNS;
     this.turnSeconds = Number(params.get("turnSeconds")) || DEFAULT_TURN_SECONDS;
     this.session.onControl = (kind) => {
@@ -107,14 +162,21 @@ export class MpGameScreen extends Screen {
         }
       }
     };
-    // Host aggregates each peer's finalized cart; guests stash the authoritative
-    // outcome and apply it in the update loop (not in this network callback).
-    this.session.onShopResult = (deviceId, inv, cash) => {
-      if (this.isHost) this.shopResults.set(deviceId, { inv, cash });
+    // Every client records carts (drives the "waiting for ..." display); the host's
+    // copy is also the authoritative aggregation. A cart doubles as a sign of life.
+    // Guests stash the authoritative outcome and apply it in the update loop (not in
+    // this network callback).
+    this.session.onShopResult = (deviceId, round, inv, cash) => {
+      this.shopCarts.set(deviceId, { round, inv, cash });
+      if (this.isHost) this.hostLastActMs.set(deviceId, Date.now());
     };
-    this.session.onShopFinal = (results) => {
-      if (!this.isHost) this.pendingShopFinal = results;
+    this.session.onShopActivity = (deviceId, round) => {
+      if (this.isHost && round === this.shopRound) this.hostLastActMs.set(deviceId, Date.now());
     };
+    this.session.onShopFinal = (round, results) => {
+      if (!this.isHost) this.pendingShopFinal = { round, results };
+    };
+    this.session.onChat = (deviceId, text) => this._pushChat(this._nameOf(deviceId), text);
     // Test hook (harness only, ?test=1): commit an rng-free aimed shot on this
     // client's turn. NEVER exposed in production -- it would be a console auto-fire
     // cheat. (Calling the engine AI would draw rng on only the active client and
@@ -223,7 +285,25 @@ export class MpGameScreen extends Screen {
       }
       return null;
     }
-    // While the local shop is open it takes all input (until ~Done or the window ends);
+    // Chat input is modal: while the compose box is open it captures EVERY key
+    // (Esc cancels, Enter sends, Backspace edits, printable chars append), so chat
+    // can never collide with aim keys (Space/Enter fire!) or shop accelerators.
+    if (this.chatOpen && event.type === pygame.KEYDOWN) {
+      // Typing chat is being at the keyboard: while the local shop is open it also
+      // counts as shop activity, so composing a line can't idle a shopper out.
+      if (gs.phase === SHOP && this.shopStack.length > 0) this._noteShopActivity();
+      this._handleChatKey(event);
+      return null;
+    }
+    // Backquote opens chat anywhere in the match (aim, flight, shop, waiting).
+    // The key is otherwise unused by the engine (Enter fires, 't' is the control
+    // panel, Tab cycles weapons -- all unavailable).
+    if (event.type === pygame.KEYDOWN && event.key === pygame.K_BACKQUOTE) {
+      if (gs.phase === SHOP && this.shopStack.length > 0) this._noteShopActivity();
+      this.chatOpen = true;
+      return null;
+    }
+    // While the local shop is open it takes all input (until ~Done or idle-out);
     // Esc inside the shop must not leave the match.
     if (gs.phase === SHOP && this.shopStack.length > 0) {
       return this._handleShop(event);
@@ -248,6 +328,7 @@ export class MpGameScreen extends Screen {
   }
 
   override update(dt: number): ScreenAction {
+    this.nowS += dt; // screen clock (chat fading); independent of the sim
     const gs = this.adapter.state();
     if (!gs) return null;
     this.gsRef = gs;
@@ -278,6 +359,10 @@ export class MpGameScreen extends Screen {
       hash: this.adapter.worldHash(),
       inv: this._invHash(gs),
       shopping: this.shopStack.length > 0,
+      shopIdle: Math.round(this.shopIdle * 10) / 10,
+      waitingFor: gs.phase === SHOP ? this._pendingNames() : [],
+      chatCount: this.chatLines.length,
+      chatLast: this.chatLines.length > 0 ? this.chatLines[this.chatLines.length - 1].text : null,
       aborted: this.aborted,
       alive: gs.tanks.filter((t) => t.alive).length,
     };
@@ -372,25 +457,31 @@ export class MpGameScreen extends Screen {
     }
   }
 
-  /** Between-round shop: a flat timed window (default 60s). Each human shops their own
-   *  tank locally; at the barrier (all done, or the window + grace elapses) the HOST
-   *  broadcasts one authoritative post-shop snapshot of every human tank and every
-   *  client applies it before begin_next_round, so message ordering can't desync the
-   *  inventories. A player who is idle past the window gets the pre-shop state (nothing). */
+  /** Between-round shop: all humans shop CONCURRENTLY, each on their own tank, and
+   *  the round advances only at the host-controlled barrier: every human's cart is
+   *  in, OR every missing human has shown no shop activity for shopSeconds(+grace),
+   *  OR the absolute ceiling elapsed (anti-stall backstop). The host then broadcasts
+   *  one authoritative post-shop snapshot of every human tank and every client
+   *  applies it before begin_next_round, so message ordering can't desync the
+   *  inventories. An idle player auto-submits whatever is in their cart so far. */
   private _coordinateShop(gs: GameState, dt: number): void {
     if (this.shopRound !== gs.round_index) {
-      // First frame of this shop: reset, and (host) snapshot pre-shop state = "nothing".
+      // First frame of this shop: reset the per-shop state. shopCarts is kept --
+      // carts are round-tagged and one for THIS shop may already have arrived.
       this.shopRound = gs.round_index;
       this.shopElapsed = 0;
+      this.shopIdle = 0;
+      this.shopActAge = SHOP_ACT_INTERVAL_SECONDS; // first activity broadcasts immediately
       this.shopDone = false;
       this.shopSubmitted = false;
       this.shopfinApplied = false;
       this.shopStack = [];
-      this.shopResults.clear();
       this.preShop.clear();
-      this.pendingShopFinal = null;
+      this.hostLastActMs.clear();
       if (this.isHost) {
+        const now = Date.now();
         for (const d of this.adapter.humanDeviceIds()) {
+          this.hostLastActMs.set(d, now); // every idle clock starts at shop open
           const s = this.adapter.shopSnapshot(d);
           if (s) this.preShop.set(d, s);
         }
@@ -399,9 +490,9 @@ export class MpGameScreen extends Screen {
     this.banner = "";
     if (this.shopfinApplied) return; // already advanced to the next round on this client
 
-    // Guest: apply the host's authoritative outcome the moment it has arrived.
-    if (!this.isHost && this.pendingShopFinal) {
-      this._applyShopFinal(this.pendingShopFinal);
+    // Guest: apply the host's authoritative outcome for THIS shop once it arrives.
+    if (!this.isHost && this.pendingShopFinal && this.pendingShopFinal.round === this.shopRound) {
+      this._applyShopFinal(this.pendingShopFinal.results);
       this.pendingShopFinal = null;
       return;
     }
@@ -414,30 +505,44 @@ export class MpGameScreen extends Screen {
     }
 
     this.shopElapsed += dt;
-    // Local auto-finalize when the window elapses (idle => nothing); a non-human local
-    // has nothing to submit, so it finalizes immediately so it never blocks the barrier.
-    if (!this.shopSubmitted && (this.shopElapsed >= this.shopSeconds || !iAmHuman)) {
+    this.shopIdle += dt;
+    this.shopActAge += dt;
+    // Local inactivity auto-finish: submit the cart as it stands (purchases so far
+    // are KEPT). An active player never times out -- _noteShopActivity resets the
+    // clock on every shop input. A non-human local slot has nothing to shop, so it
+    // finalizes immediately and never blocks the barrier.
+    if (!this.shopSubmitted && (this.shopIdle >= this.shopSeconds || !iAmHuman)) {
       this._submitLocalCart(iAmHuman);
     }
 
-    // Host barrier: fire when every human submitted, or the window + grace elapsed.
+    // Host barrier (see shopBarrierReady for the exact rule).
     if (this.isHost) {
       const humans = this.adapter.humanDeviceIds();
-      const allIn = humans.length > 0 && humans.every((d) => this.shopResults.has(d));
-      if (allIn || this.shopElapsed >= this.shopSeconds + SHOP_GRACE_SECONDS) {
+      const now = Date.now();
+      const why = shopBarrierReady({
+        humans,
+        submitted: new Set(humans.filter((d) => this.shopCarts.get(d)?.round === this.shopRound)),
+        idleMsOf: (d) => now - (this.hostLastActMs.get(d) ?? now),
+        idleLimitMs: (this.shopSeconds + SHOP_GRACE_SECONDS) * 1000,
+        elapsedS: this.shopElapsed,
+        ceilingS: this.shopCeiling,
+      });
+      if (why) {
         const results: Record<string, ShopResult> = {};
         for (const d of humans) {
-          const r = this.shopResults.get(d) ?? this.preShop.get(d);
+          const cart = this.shopCarts.get(d);
+          const r = cart && cart.round === this.shopRound ? { inv: cart.inv, cash: cart.cash } : this.preShop.get(d);
           if (r) results[d] = r;
         }
-        this.session.sendShopFinal(results);
+        this.session.sendShopFinal(this.shopRound, results);
         this._applyShopFinal(results);
       }
     }
   }
 
-  /** Finalize the local player's purchases: snapshot inventory+cash, submit (guest
-   *  broadcasts; host records its own), and close the shop UI. Idempotent per shop. */
+  /** Finalize the local player's purchases: snapshot inventory+cash, record + broadcast
+   *  the cart (every client shows who is done; the host aggregates authoritatively),
+   *  and close the shop UI. Idempotent per shop. */
   private _submitLocalCart(iAmHuman: boolean): void {
     if (this.shopSubmitted) return;
     this.shopSubmitted = true;
@@ -446,8 +551,96 @@ export class MpGameScreen extends Screen {
     if (!iAmHuman) return;
     const snap = this.adapter.shopSnapshot(DEVICE_ID);
     if (!snap) return;
-    if (this.isHost) this.shopResults.set(DEVICE_ID, snap);
-    else this.session.sendShop(snap.inv, snap.cash);
+    this.shopCarts.set(DEVICE_ID, { round: this.shopRound, inv: snap.inv, cash: snap.cash });
+    this.session.sendShop(this.shopRound, snap.inv, snap.cash);
+    if (this.isHost) this.hostLastActMs.set(DEVICE_ID, Date.now());
+  }
+
+  /** Local shop input: reset the idle clock; guests also (throttled) broadcast a
+   *  "still shopping" keepalive so the host's independent idle rule stays fresh. */
+  private _noteShopActivity(): void {
+    this.shopIdle = 0;
+    if (this.isHost) {
+      this.hostLastActMs.set(DEVICE_ID, Date.now());
+    } else if (this.shopActAge >= SHOP_ACT_INTERVAL_SECONDS) {
+      this.shopActAge = 0;
+      this.session.sendShopActivity(this.shopRound);
+    }
+  }
+
+  /** Humans whose cart for the CURRENT shop has not been seen locally (display). */
+  private _pendingNames(): string[] {
+    return this.adapter
+      .humanDeviceIds()
+      .filter((d) => this.shopCarts.get(d)?.round !== this.shopRound)
+      .map((d) => this._nameOf(d));
+  }
+
+  private _nameOf(deviceId: string): string {
+    const p = this.session.match.players().find((q) => q.deviceId === deviceId);
+    return p ? p.name : deviceId.slice(0, 6);
+  }
+
+  // ── chat (overlay-only; the wire layer sanitizes + rate-limits) ──────────────
+
+  private _pushChat(name: string, text: string): void {
+    this.chatLines.push({ name, text, at: this.nowS });
+    if (this.chatLines.length > CHAT_KEEP) this.chatLines.splice(0, this.chatLines.length - CHAT_KEEP);
+  }
+
+  /** Modal compose-box keys: Esc cancels, Enter sends, Backspace edits, printable
+   *  characters append (event.unicode carries the produced character). */
+  private _handleChatKey(event: ScreenEvent): void {
+    if (event.key === pygame.K_ESCAPE) {
+      this.chatOpen = false;
+      this.chatText = "";
+      return;
+    }
+    if (event.key === pygame.K_RETURN || event.key === pygame.K_KP_ENTER) {
+      const clean = sanitizeChat(this.chatText); // mirror exactly what the wire will carry
+      if (clean) {
+        this.session.sendChat(clean);
+        this._pushChat(this._nameOf(DEVICE_ID), clean); // broadcast excludes self: local echo
+      }
+      this.chatOpen = false;
+      this.chatText = "";
+      return;
+    }
+    if (event.key === pygame.K_BACKSPACE) {
+      this.chatText = this.chatText.slice(0, -1);
+      return;
+    }
+    const u = event.unicode ?? "";
+    if (u.length === 1 && u.charCodeAt(0) >= 0x20 && this.chatText.length < CHAT_INPUT_MAX) {
+      this.chatText += u;
+    }
+  }
+
+  /** Transparent chat overlay: the last few lines (fading) above the MP status
+   *  line, plus the compose box while typing. Drawn over gameplay AND the shop. */
+  private _drawChat(surf: pygame.Surface): void {
+    const f = W.font(14, false);
+    const vis = this.chatLines.filter((l) => this.nowS - l.at < CHAT_TTL_S).slice(-CHAT_SHOW);
+    const rows = vis.length + (this.chatOpen ? 1 : 0);
+    if (rows === 0) return;
+    const lh = f.get_height() + 4;
+    const x = 12;
+    const w = 620;
+    const y0 = this.app.h - 66 - rows * lh;
+    // Semi-transparent backdrop so the text reads over terrain/shop alike.
+    const ov = new pygame.Surface([w, rows * lh + 10], pygame.SRCALPHA);
+    ov.fill([0, 0, 0, 110]);
+    surf.blit(ov, [x - 6, y0 - 5]);
+    let y = y0;
+    for (const l of vis) {
+      const name = f.render(`${l.name}: `, true, [180, 220, 255]);
+      surf.blit(name, [x, y]);
+      surf.blit(f.render(l.text, true, [235, 235, 235]), [x + name.get_width(), y]);
+      y += lh;
+    }
+    if (this.chatOpen) {
+      surf.blit(f.render(`say: ${this.chatText}_`, true, [140, 230, 160]), [x, y]);
+    }
   }
 
   /** Apply the host's authoritative post-shop state to every human tank, then resolve
@@ -469,6 +662,12 @@ export class MpGameScreen extends Screen {
     const gs = this.adapter.state();
     const top = this.shopStack[this.shopStack.length - 1];
     if (!gs || !top) return null;
+    // Any interaction with the open shop is activity: reset the local idle clock and
+    // (throttled) tell the host this player is still shopping, so an actively buying
+    // player is never timed out from either side.
+    if (event.type === pygame.KEYDOWN || event.type === pygame.MOUSEBUTTONDOWN || event.type === pygame.MOUSEMOTION) {
+      this._noteShopActivity();
+    }
     const a = top.handle(event);
     if (a === "pop") {
       if (this.shopStack.length > 1) this.shopStack.pop();
@@ -519,19 +718,29 @@ export class MpGameScreen extends Screen {
       return;
     }
     if (gs.phase === SHOP) {
-      const left = Math.max(0, Math.ceil(this.shopSeconds - this.shopElapsed));
       if (this.shopStack.length > 0) {
-        // Local shop is open: draw it (its screens are opaque) + a window countdown.
+        // Local shop is open: draw it (its screens are opaque). No global countdown --
+        // an ACTIVE shopper is never timed out. Only warn once the idle clock nears
+        // the local auto-finish.
         for (const s of this.shopStack) s.draw(surf);
-        center(fs.render(`shop closes in ${left}s  -  ~Done to finish`, true, [235, 235, 235]), this.app.h - 22);
+        const idleLeft = Math.ceil(this.shopSeconds - this.shopIdle);
+        const msg =
+          idleLeft <= 15
+            ? `idle -- shop auto-finishes in ${Math.max(0, idleLeft)}s (any input resets)`
+            : "~Done to finish  -  ` to chat";
+        center(fs.render(msg, true, idleLeft <= 15 ? [255, 180, 120] : [235, 235, 235]), this.app.h - 22);
+        this._drawChat(surf);
         return;
       }
-      // Shopping done (or no shop for me): standings + countdown while others finish.
+      // Shopping done (or no shop for me): standings while the others finish. The
+      // round advances when everyone is done (host-controlled), NOT on a countdown.
       const remain = Math.max(0, ((gs.cfg as { MAXROUNDS?: number }).MAXROUNDS ?? 0) - gs.round_index);
       ui.draw_rankings(surf, this.app.renderer as never, gs as never, "Standings", remain);
-      const msg = left > 0 ? `next round in ${left}s` : "starting next round...";
+      const pending = this._pendingNames();
+      const msg = pending.length > 0 ? `waiting for ${pending.join(", ")}  -  \` to chat` : "starting next round...";
       center(fs.render(msg, true, [235, 235, 235]), this.app.h - 40);
       this._drawConnSummary(surf, fs);
+      this._drawChat(surf);
       return;
     }
 
@@ -547,6 +756,7 @@ export class MpGameScreen extends Screen {
       surf.blit(fs.render(`turn ${left}s`, true, left <= 5 ? [255, 160, 120] : [200, 200, 200]), [12, by - 20]);
     }
     this._drawConnSummary(surf, fs);
+    this._drawChat(surf); // chat rides over gameplay too (backquote to talk)
   }
 
   /** bottom-right: live connection summary (the "connection info during the match"). */

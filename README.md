@@ -38,16 +38,23 @@ each turn clients exchange a world hash so divergence is caught.
 
 ### How to play
 
-1. Main Menu -> **Multiplayer** -> choose your name and tank on the setup screen
+1. Main Menu -> **Online Play** -> choose your name and tank on the setup screen
    (color and starting position are randomized).
 2. **Create Private Match** (share the invite code) or **Create Public Match** (others
    find it in the public list), or **Join by Code**.
 3. When everyone shows connected, the host presses **Start**. Players take turns:
    adjust angle (left/right) and power (up/down), then **Space** to fire. A countdown
    bounds each turn, and the match runs a set number of rounds.
-4. **Between rounds a 60-second weapon shop opens.** Each player shops their own tank;
-   purchases are replicated to every client. If everyone finishes early the next round
-   starts immediately; anyone still idle when the timer runs out gets nothing.
+4. **Between rounds the weapon shop opens for everyone at once.** Each player shops
+   their own tank; purchases are replicated to every client. The next round starts
+   when **every player has finished** (host-coordinated). There is no flat countdown:
+   a player only times out after 60 seconds of shop **inactivity** (any input resets
+   it), which then auto-submits whatever is in their cart. An absolute per-shop
+   ceiling (5 minutes) stops a hostile client from stalling the match forever.
+5. **Chat any time with the backquote key (`)** - during aiming, flight, the shop, or
+   the between-round wait. It is a transparent overlay: Esc cancels, Enter sends,
+   lines fade after a few seconds. Chat rides its own message type and never touches
+   the simulation.
 
 ### What works (verified)
 
@@ -66,6 +73,11 @@ converged (identical world hash, zero desyncs). Verified by:
 - A 3-browser **shop test**: two players buy weapons and one buys nothing; every client
   converges on identical inventories (an inventory digest, since the world hash omits
   inventory) plus identical world hash, zero desyncs.
+- A 2-browser **shop-barrier + chat acceptance**: an untouched shop auto-finishes at the
+  idle allowance (not before, not at the ceiling); a player **actively shopping far past
+  the idle allowance is never cut off** and the round advances within a second of the
+  last cart; chat lines typed with real keys replicate to the other browser during
+  gameplay and over the open shop; inventories and world hashes converge, zero desyncs.
 - A desync-detection test: a clean run reports zero desyncs, and a deliberately injected
   divergence on one client is caught by the host.
 - Behavioral checks for the per-turn forfeit and match-ends-on-disconnect.
@@ -78,10 +90,14 @@ never applies the next turn while still animating the previous shot); round-end 
 turn-cap forfeit are recomputed deterministically on every client. The between-round shop
 is host-authoritative: each player submits its own finalized cart, and the host broadcasts
 one snapshot of every tank's inventory that every client applies before the next round, so
-message ordering cannot desync inventories. Untrusted peer input is bounds-checked
-(angle/power/weapon clamped, NaN rejected, the turn buffer is windowed and per-sender), and
-match-control messages (start / forfeit / shop outcome) are accepted only from the host's
-authenticated data channel.
+message ordering cannot desync inventories. The host advances the shop only when every
+cart is in, when every missing player has been shop-inactive past the allowance, or at the
+absolute ceiling; shop carts and keepalives are **round-tagged** so a message from one shop
+can never satisfy another shop's barrier. Untrusted peer input is bounds-checked
+(angle/power/weapon clamped, NaN rejected, the turn buffer is windowed and per-sender),
+chat is sanitized (control characters stripped, length-capped) and per-peer rate-limited,
+and match-control messages (start / forfeit / shop outcome) are accepted only from the
+host's authenticated data channel.
 
 ### Not production-ready (honest limitations)
 
@@ -124,7 +140,7 @@ overlay, shop, and standings. Both clients run the same deterministic engine in 
 |   |   |   |
 |:---:|:---:|:---:|
 | <img src="screenshots/mp-lobby.png" width="270"><br>Create a match (invite code) | <img src="screenshots/mp-lobby-ready.png" width="270"><br>Lobby: both players connected | <img src="screenshots/mp-turn.png" width="270"><br>Your turn |
-| <img src="screenshots/mp-waiting.png" width="270"><br>The other player's turn | <img src="screenshots/mp-shop.png" width="270"><br>The 60-second weapon shop | <img src="screenshots/mp-standings.png" width="270"><br>Between-round standings |
+| <img src="screenshots/mp-waiting.png" width="270"><br>The other player's turn | <img src="screenshots/mp-shop.png" width="270"><br>The between-round weapon shop | <img src="screenshots/mp-standings.png" width="270"><br>Between-round standings |
 
 ### Single-player
 
